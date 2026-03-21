@@ -1,0 +1,135 @@
+{
+  "name": "uvm-assistant",
+  "displayName": "UVM-Assistant",
+  "description": "Analyzes Verilog/SystemVerilog workspaces to visualize module hierarchy, UVM class hierarchy, and UVM block diagrams.",
+  "version": "0.3.0",
+  "publisher": "uvm-assistant",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Visualization",
+    "Other"
+  ],
+  "keywords": [
+    "verilog",
+    "systemverilog",
+    "uvm",
+    "hierarchy",
+    "block diagram",
+    "linter",
+    "formatter"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "uvm-assistant-explorer",
+          "title": "UVM-Assistant",
+          "icon": "resources/uvm-assistant-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "uvm-assistant-explorer": [
+        {
+          "id": "moduleHierarchy",
+          "name": "Module Hierarchy"
+        },
+        {
+          "id": "uvmClassHierarchy",
+          "name": "UVM Classes"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "uvm-assistant.openBlockDiagram",
+        "title": "Open UVM Block Diagram",
+        "category": "UVM-Assistant",
+        "icon": "$(circuit-board)"
+      },
+      {
+        "command": "uvm-assistant.refresh",
+        "title": "Refresh Analysis",
+        "category": "UVM-Assistant",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "uvm-assistant.formatDocument",
+        "title": "Format with Verible",
+        "category": "UVM-Assistant"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "uvm-assistant.openBlockDiagram",
+          "when": "view == uvmClassHierarchy",
+          "group": "navigation"
+        },
+        {
+          "command": "uvm-assistant.refresh",
+          "when": "view == moduleHierarchy || view == uvmClassHierarchy",
+          "group": "navigation"
+        }
+      ]
+    },
+    "languages": [
+      {
+        "id": "systemverilog",
+        "extensions": [".sv", ".svh"]
+      },
+      {
+        "id": "verilog",
+        "extensions": [".v", ".vh"]
+      }
+    ],
+    "configuration": {
+      "title": "UVM-Assistant",
+      "properties": {
+        "uvm-assistant.verible.path": {
+          "type": "string",
+          "default": "verible-verilog-format",
+          "description": "Path to the verible-verilog-format binary."
+        },
+        "uvm-assistant.verible.columnLimit": {
+          "type": "number",
+          "default": 100,
+          "description": "Maximum column width for formatted output."
+        },
+        "uvm-assistant.verible.portDeclarationsAlignment": {
+          "type": "string",
+          "default": "infer",
+          "enum": ["align", "flush-left", "preserve", "infer"],
+          "description": "Alignment mode for port declarations."
+        },
+        "uvm-assistant.verible.tryWrapLongLines": {
+          "type": "boolean",
+          "default": true,
+          "description": "Attempt to wrap long lines during formatting."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "node esbuild.js --production",
+    "compile": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "lint": "tsc --noEmit",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "web-tree-sitter": "^0.24.3"
+  }
+}
