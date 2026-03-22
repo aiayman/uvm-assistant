@@ -59,7 +59,6 @@ const DUT_W = 140;
 const DUT_H = 80;
 const TRACK_SPACING = 12;
 const BLOCK_ARROW_GAP = 14;
-const CORNER_R = 3;
 const PORT_CIRCLE_R = 3.5;
 
 // Pipeline stage order (lower = further left)
@@ -790,25 +789,14 @@ function routeAndDrawArrows(parent: SVGGElement, arrows: Arrow[]): void {
   const routed: RoutedArrow[] = [];
 
   for (const a of arrows) {
-    const fromCy = a.from.y + a.from.h / 2;
-    const toCy = a.to.y + a.to.h / 2;
-
-    let srcSide: Side, tgtSide: Side;
-
-    if (a.from.x + a.from.w + 2 < a.to.x) {
-      srcSide = 'right'; tgtSide = 'left';
-    } else if (a.to.x + a.to.w + 2 < a.from.x) {
-      srcSide = 'left'; tgtSide = 'right';
-    } else if (fromCy <= toCy) {
-      srcSide = 'bottom'; tgtSide = 'top';
-    } else {
-      srcSide = 'top'; tgtSide = 'bottom';
-    }
+    // CONSTRAINT2/3: output ports always RIGHT, input ports always LEFT
+    const srcSide: Side = 'right';
+    const tgtSide: Side = 'left';
 
     routed.push({ arrow: a, srcSide, tgtSide, srcX: 0, srcY: 0, tgtX: 0, tgtY: 0, waypoints: [] });
   }
 
-  // Step 2: Distribute connection points per block side
+  // Step 2: Distribute connection points per block side with PORT_GAP spacing
   interface SideSlot {
     ra: RoutedArrow;
     isSource: boolean;
@@ -818,8 +806,8 @@ function routeAndDrawArrows(parent: SVGGElement, arrows: Arrow[]): void {
   const sideMap = new Map<string, SideSlot[]>();
 
   for (const ra of routed) {
-    const srcKey = `${ra.arrow.from.node.className}::${ra.srcSide}`;
-    const tgtKey = `${ra.arrow.to.node.className}::${ra.tgtSide}`;
+    const srcKey = `${ra.arrow.from.node.className}::right`;
+    const tgtKey = `${ra.arrow.to.node.className}::left`;
 
     if (!sideMap.has(srcKey)) sideMap.set(srcKey, []);
     sideMap.get(srcKey)!.push({ ra, isSource: true, otherBlock: ra.arrow.to });
@@ -828,33 +816,24 @@ function routeAndDrawArrows(parent: SVGGElement, arrows: Arrow[]): void {
     sideMap.get(tgtKey)!.push({ ra, isSource: false, otherBlock: ra.arrow.from });
   }
 
-  for (const [key, slots] of sideMap) {
-    const side = key.split('::')[1] as Side;
+  for (const [, slots] of sideMap) {
     const block = slots[0].isSource ? slots[0].ra.arrow.from : slots[0].ra.arrow.to;
 
+    // Sort by Y position of the other block for vertical ordering
     slots.sort((a, b) => {
       const aCy = a.otherBlock.y + a.otherBlock.h / 2;
       const bCy = b.otherBlock.y + b.otherBlock.h / 2;
-      const aCx = a.otherBlock.x + a.otherBlock.w / 2;
-      const bCx = b.otherBlock.x + b.otherBlock.w / 2;
-      return (side === 'right' || side === 'left') ? aCy - bCy : aCx - bCx;
+      return aCy - bCy;
     });
 
     const count = slots.length;
-    const margin = 12;
+    // Use PORT_GAP spacing between connection points, centered on the block
+    const totalSpan = (count - 1) * PORT_GAP;
+    const startY = block.y + (block.h - totalSpan) / 2;
 
     for (let i = 0; i < count; i++) {
-      const t = count === 1 ? 0.5 : (margin + ((side === 'right' || side === 'left'
-        ? (block.h - 2 * margin)
-        : (block.w - 2 * margin)) * i / (count - 1))) / (side === 'right' || side === 'left' ? block.h : block.w);
-
-      let px: number, py: number;
-      switch (side) {
-        case 'right':  px = block.x + block.w; py = block.y + block.h * t; break;
-        case 'left':   px = block.x;           py = block.y + block.h * t; break;
-        case 'bottom': px = block.x + block.w * t; py = block.y + block.h; break;
-        case 'top':    px = block.x + block.w * t; py = block.y; break;
-      }
+      const py = count === 1 ? block.y + block.h / 2 : startY + i * PORT_GAP;
+      const px = slots[i].isSource ? block.x + block.w : block.x;
 
       if (slots[i].isSource) {
         slots[i].ra.srcX = px; slots[i].ra.srcY = py;
@@ -870,8 +849,14 @@ function routeAndDrawArrows(parent: SVGGElement, arrows: Arrow[]): void {
   // Step 4: Deconflict parallel vertical and horizontal tracks
   deconflictTracks(routed);
 
-  // Step 6: Draw
+  // Step 5: Post-route collision check — reroute any segments that strike through blocks
+  for (const ra of routed) fixCollisions(ra);
+
+  // Step 6: Draw arrows
   for (const ra of routed) drawOrthoArrow(parent, ra);
+
+  // Step 7: Draw multi-connection junction indicators
+  drawJunctions(parent, routed);
 }
 
 // ─── Segment collision helpers ─────────────────────────────────
@@ -934,41 +919,19 @@ function findClearVChannel(xL: number, xR: number, y1: number, y2: number, obs: 
 // ─── Collision-aware orthogonal path computation ──────────────
 
 function computeOrthoPath(ra: RoutedArrow): void {
-  const { srcX: x1, srcY: y1, tgtX: x2, tgtY: y2, srcSide, tgtSide, arrow } = ra;
+  const { srcX: x1, srcY: y1, tgtX: x2, tgtY: y2, arrow } = ra;
 
   const obs = drawnBlocks.filter(b =>
     b.node.className !== arrow.from.node.className &&
     b.node.className !== arrow.to.node.className
   );
 
-  if (srcSide === 'right' && tgtSide === 'left') {
+  // Always right→left. Use routeHorizontal when target is to the right,
+  // routeBackwards when target is to the left (wraps around).
+  if (x2 > x1) {
     ra.waypoints = routeHorizontal(x1, y1, x2, y2, obs);
-  } else if (srcSide === 'left' && tgtSide === 'right') {
-    ra.waypoints = routeBackwards(x1, y1, x2, y2, obs);
-  } else if ((srcSide === 'bottom' && tgtSide === 'top') ||
-             (srcSide === 'top' && tgtSide === 'bottom')) {
-    ra.waypoints = routeVertical(x1, y1, x2, y2, obs);
   } else {
-    // Mixed sides: L-shape with collision check
-    const pts: Pt[] = [{ x: x1, y: y1 }];
-    if (srcSide === 'right' || srcSide === 'left') {
-      const midPt = { x: x2, y: y1 };
-      if (hSegHitsBlock(x1, x2, y1, obs) || vSegHitsBlock(x2, y1, y2, obs)) {
-        // Fall back to Z-shape routing
-        ra.waypoints = routeHorizontal(x1, y1, x2, y2, obs);
-        return;
-      }
-      pts.push(midPt);
-    } else {
-      const midPt = { x: x1, y: y2 };
-      if (vSegHitsBlock(x1, y1, y2, obs) || hSegHitsBlock(x1, x2, y2, obs)) {
-        ra.waypoints = routeVertical(x1, y1, x2, y2, obs);
-        return;
-      }
-      pts.push(midPt);
-    }
-    pts.push({ x: x2, y: y2 });
-    ra.waypoints = pts;
+    ra.waypoints = routeBackwards(x1, y1, x2, y2, obs);
   }
 }
 
@@ -1050,32 +1013,6 @@ function routeBackwards(x1: number, y1: number, x2: number, y2: number, obs: Blo
   ];
 }
 
-function routeVertical(x1: number, y1: number, x2: number, y2: number, obs: BlockRect[]): Pt[] {
-  if (Math.abs(x1 - x2) < 2) {
-    if (!vSegHitsBlock(x1, y1, y2, obs)) return [{ x: x1, y: y1 }, { x: x2, y: y2 }];
-  }
-  const midY = Math.round((y1 + y2) / 2);
-  // Check if the Z-shape hits any blocks
-  if (!vSegHitsBlock(x1, y1, midY, obs) && !hSegHitsBlock(x1, x2, midY, obs) && !vSegHitsBlock(x2, midY, y2, obs)) {
-    return [{ x: x1, y: y1 }, { x: x1, y: midY }, { x: x2, y: midY }, { x: x2, y: y2 }];
-  }
-  // Try routing above or below the obstacles
-  const yMin = Math.min(y1, y2), yMax = Math.max(y1, y2);
-  const blockers = obs.filter(b => b.x + b.w > Math.min(x1, x2) - 4 && b.x < Math.max(x1, x2) + 4 && b.y + b.h > yMin && b.y < yMax);
-  if (blockers.length > 0) {
-    const clearAbove = Math.min(...blockers.map(b => b.y)) - BLOCK_ARROW_GAP;
-    const clearBelow = Math.max(...blockers.map(b => b.y + b.h)) + BLOCK_ARROW_GAP;
-    const useAbove = Math.abs(clearAbove - (y1 + y2) / 2) < Math.abs(clearBelow - (y1 + y2) / 2);
-    const detourY = useAbove ? clearAbove : clearBelow;
-    if (containerBounds) {
-      const clampedY = Math.max(containerBounds.y + HEADER_H + 6, Math.min(containerBounds.y + containerBounds.h - 6, detourY));
-      return [{ x: x1, y: y1 }, { x: x1, y: clampedY }, { x: x2, y: clampedY }, { x: x2, y: y2 }];
-    }
-    return [{ x: x1, y: y1 }, { x: x1, y: detourY }, { x: x2, y: detourY }, { x: x2, y: y2 }];
-  }
-  return [{ x: x1, y: y1 }, { x: x1, y: midY }, { x: x2, y: midY }, { x: x2, y: y2 }];
-}
-
 // ─── Track deconfliction ──────────────────────────────────────
 
 interface SegInfo { routeIdx: number; segIdx: number; pos: number; min: number; max: number }
@@ -1128,27 +1065,153 @@ function spreadOverlapping(segs: SegInfo[], routed: RoutedArrow[], axis: 'v' | '
   }
 }
 
+// ─── Post-route collision fix ──────────────────────────────────
+
+function fixCollisions(ra: RoutedArrow): void {
+  const pts = ra.waypoints;
+  if (pts.length < 2) return;
+  const obs = drawnBlocks.filter(b =>
+    b.node.className !== ra.arrow.from.node.className &&
+    b.node.className !== ra.arrow.to.node.className
+  );
+
+  // Check each segment and reroute if it hits a block
+  let changed = true;
+  let passes = 0;
+  while (changed && passes < 5) {
+    changed = false;
+    passes++;
+    for (let i = 0; i < pts.length - 1; i++) {
+      const p1 = pts[i], p2 = pts[i + 1];
+      const isH = Math.abs(p1.y - p2.y) < 1;
+      const isV = Math.abs(p1.x - p2.x) < 1;
+
+      if (isH && hSegHitsBlock(p1.x, p2.x, p1.y, obs)) {
+        // Horizontal segment hits a block — find a clear Y and reroute with a detour
+        const xMin = Math.min(p1.x, p2.x), xMax = Math.max(p1.x, p2.x);
+        const blockers = obs.filter(b =>
+          b.x + b.w > xMin + 2 && b.x < xMax - 2 &&
+          p1.y > b.y - BLOCK_ARROW_GAP && p1.y < b.y + b.h + BLOCK_ARROW_GAP
+        );
+        if (blockers.length > 0) {
+          const above = Math.min(...blockers.map(b => b.y)) - BLOCK_ARROW_GAP;
+          const below = Math.max(...blockers.map(b => b.y + b.h)) + BLOCK_ARROW_GAP;
+          const detourY = Math.abs(p1.y - above) < Math.abs(p1.y - below) ? above : below;
+          // Replace segment with 3-segment detour: down/up, across, up/down
+          const midX1 = p1.x + (p2.x > p1.x ? TRACK_SPACING : -TRACK_SPACING);
+          const midX2 = p2.x + (p2.x > p1.x ? -TRACK_SPACING : TRACK_SPACING);
+          pts.splice(i + 1, 0,
+            { x: midX1, y: p1.y }, { x: midX1, y: detourY },
+            { x: midX2, y: detourY }, { x: midX2, y: p2.y }
+          );
+          changed = true;
+          break;
+        }
+      } else if (isV && vSegHitsBlock(p1.x, p1.y, p2.y, obs)) {
+        // Vertical segment hits a block — find a clear X and reroute
+        const yMin = Math.min(p1.y, p2.y), yMax = Math.max(p1.y, p2.y);
+        const blockers = obs.filter(b =>
+          p1.x > b.x - BLOCK_ARROW_GAP && p1.x < b.x + b.w + BLOCK_ARROW_GAP &&
+          yMax > b.y + 2 && yMin < b.y + b.h - 2
+        );
+        if (blockers.length > 0) {
+          const clearX = findClearVChannel(
+            Math.min(p1.x, p2.x) - 60, Math.max(p1.x, p2.x) + 60,
+            p1.y, p2.y, obs
+          );
+          const midY1 = p1.y + (p2.y > p1.y ? TRACK_SPACING : -TRACK_SPACING);
+          const midY2 = p2.y + (p2.y > p1.y ? -TRACK_SPACING : TRACK_SPACING);
+          pts.splice(i + 1, 0,
+            { x: p1.x, y: midY1 }, { x: clearX, y: midY1 },
+            { x: clearX, y: midY2 }, { x: p2.x, y: midY2 }
+          );
+          changed = true;
+          break;
+        }
+      }
+    }
+  }
+}
+
+// ─── Multi-connection junction indicators ──────────────────────
+
+function drawJunctions(parent: SVGGElement, routed: RoutedArrow[]): void {
+  // Find connection points where multiple arrows share the same origin/destination point
+  const pointMap = new Map<string, { x: number; y: number; color: string; count: number }>();
+
+  for (const ra of routed) {
+    const pts = ra.waypoints;
+    if (pts.length < 2) continue;
+
+    // Source point
+    const sk = `${Math.round(pts[0].x)},${Math.round(pts[0].y)}`;
+    if (pointMap.has(sk)) {
+      pointMap.get(sk)!.count++;
+    } else {
+      pointMap.set(sk, { x: pts[0].x, y: pts[0].y, color: ra.arrow.color, count: 1 });
+    }
+
+    // Target point
+    const tk = `${Math.round(pts[pts.length - 1].x)},${Math.round(pts[pts.length - 1].y)}`;
+    if (pointMap.has(tk)) {
+      pointMap.get(tk)!.count++;
+    } else {
+      pointMap.set(tk, { x: pts[pts.length - 1].x, y: pts[pts.length - 1].y, color: ra.arrow.color, count: 1 });
+    }
+  }
+
+  // Draw bus-junction indicator for points with multiple connections
+  for (const [, pt] of pointMap) {
+    if (pt.count <= 1) continue;
+    // Draw a rounded rectangle (bus bar) at the junction
+    const jw = 8, jh = Math.min(pt.count * PORT_GAP, 30);
+    parent.appendChild(attrs(el('rect'), {
+      x: pt.x - jw / 2, y: pt.y - jh / 2, width: jw, height: jh,
+      rx: jw / 2, fill: pt.color, opacity: 0.5, class: 'df-port-dot',
+    }));
+  }
+}
+
 // ─── Orthogonal arrow drawing with port shapes ────────────────
+
+function enforceOrthogonal(pts: Pt[]): void {
+  // Snap each segment to be strictly horizontal or vertical
+  for (let i = 1; i < pts.length; i++) {
+    const dx = Math.abs(pts[i].x - pts[i - 1].x);
+    const dy = Math.abs(pts[i].y - pts[i - 1].y);
+    if (dx < dy) {
+      // Mostly vertical — snap X to match previous point
+      pts[i].x = pts[i - 1].x;
+    } else {
+      // Mostly horizontal — snap Y to match previous point
+      pts[i].y = pts[i - 1].y;
+    }
+  }
+}
 
 function drawOrthoArrow(parent: SVGGElement, ra: RoutedArrow): void {
   const { arrow: a, waypoints: pts } = ra;
   if (pts.length < 2) return;
 
+  // Enforce strict orthogonality — no diagonals allowed
+  enforceOrthogonal(pts);
+
   // Ensure the last segment is long enough for the arrowhead to be visible.
-  // The marker is 8 units with refX=7, so we need at least ~12px for clarity.
   const MIN_LAST_SEG = 14;
   if (pts.length >= 3) {
     const last = pts[pts.length - 1];
     const prev = pts[pts.length - 2];
     const dx = last.x - prev.x, dy = last.y - prev.y;
-    const segLen = Math.sqrt(dx * dx + dy * dy);
+    const segLen = Math.abs(dx) + Math.abs(dy); // Manhattan distance (one axis is 0)
     if (segLen > 0 && segLen < MIN_LAST_SEG) {
-      // Extend the previous waypoint away from the endpoint to lengthen the last segment
-      const scale = MIN_LAST_SEG / segLen;
-      pts[pts.length - 2] = {
-        x: last.x - dx * scale,
-        y: last.y - dy * scale,
-      };
+      // Extend along the axis of the last segment only
+      if (Math.abs(dx) > Math.abs(dy)) {
+        // Horizontal last segment — extend X
+        pts[pts.length - 2].x = last.x - Math.sign(dx) * MIN_LAST_SEG;
+      } else {
+        // Vertical last segment — extend Y
+        pts[pts.length - 2].y = last.y - Math.sign(dy) * MIN_LAST_SEG;
+      }
     }
   }
 
@@ -1164,24 +1227,11 @@ function drawOrthoArrow(parent: SVGGElement, ra: RoutedArrow): void {
     fill: a.color, stroke: '#1e1e1e', 'stroke-width': 1, class: 'df-port-dot',
   }));
 
-  // Build SVG path with tiny rounded corners at elbows
+  // Build SVG path — strictly orthogonal, no curves
   let d = `M${pts[0].x},${pts[0].y}`;
-  for (let i = 1; i < pts.length - 1; i++) {
-    const prev = pts[i - 1], curr = pts[i], next = pts[i + 1];
-    const dx1 = curr.x - prev.x, dy1 = curr.y - prev.y;
-    const dx2 = next.x - curr.x, dy2 = next.y - curr.y;
-    const len1 = Math.sqrt(dx1 * dx1 + dy1 * dy1);
-    const len2 = Math.sqrt(dx2 * dx2 + dy2 * dy2);
-    const r = Math.min(CORNER_R, len1 / 2, len2 / 2);
-    if (r > 0.5 && len1 > 0 && len2 > 0) {
-      const bx = curr.x - (dx1 / len1) * r, by = curr.y - (dy1 / len1) * r;
-      const ax = curr.x + (dx2 / len2) * r, ay = curr.y + (dy2 / len2) * r;
-      d += ` L${bx},${by} Q${curr.x},${curr.y} ${ax},${ay}`;
-    } else {
-      d += ` L${curr.x},${curr.y}`;
-    }
+  for (let i = 1; i < pts.length; i++) {
+    d += ` L${pts[i].x},${pts[i].y}`;
   }
-  d += ` L${pts[pts.length - 1].x},${pts[pts.length - 1].y}`;
 
   const arrowPath = attrs(el('path'), {
     d, class: 'df-arrow',
@@ -1208,7 +1258,7 @@ function drawOrthoArrow(parent: SVGGElement, ra: RoutedArrow): void {
     let bestLen = 0, bestMx = 0, bestMy = 0, isVert = false;
     for (let i = 0; i < pts.length - 1; i++) {
       const dx = pts[i + 1].x - pts[i].x, dy = pts[i + 1].y - pts[i].y;
-      const len = Math.sqrt(dx * dx + dy * dy);
+      const len = Math.abs(dx) + Math.abs(dy);
       if (len > bestLen) {
         bestLen = len;
         bestMx = (pts[i].x + pts[i + 1].x) / 2;
