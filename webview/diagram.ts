@@ -696,6 +696,8 @@ interface RoutedArrow {
   tgtSide: 'top' | 'right' | 'bottom' | 'left';
   srcX: number; srcY: number;
   tgtX: number; tgtY: number;
+  srcSlotIdx: number; srcSlotCount: number;
+  tgtSlotIdx: number; tgtSlotCount: number;
 }
 
 function routeAndDrawArrows(parent: SVGGElement, arrows: Arrow[]): void {
@@ -703,16 +705,11 @@ function routeAndDrawArrows(parent: SVGGElement, arrows: Arrow[]): void {
   const routed: RoutedArrow[] = [];
 
   for (const a of arrows) {
-    const fromCx = a.from.x + a.from.w / 2;
     const fromCy = a.from.y + a.from.h / 2;
-    const toCx = a.to.x + a.to.w / 2;
     const toCy = a.to.y + a.to.h / 2;
 
     let srcSide: 'top' | 'right' | 'bottom' | 'left';
     let tgtSide: 'top' | 'right' | 'bottom' | 'left';
-
-    const hGap = Math.abs(fromCx - toCx);
-    const vGap = Math.abs(fromCy - toCy);
 
     // Prefer horizontal (left/right) if blocks don't overlap horizontally
     if (a.from.x + a.from.w + 2 < a.to.x) {
@@ -732,7 +729,7 @@ function routeAndDrawArrows(parent: SVGGElement, arrows: Arrow[]): void {
       tgtSide = 'bottom';
     }
 
-    routed.push({ arrow: a, srcSide, tgtSide, srcX: 0, srcY: 0, tgtX: 0, tgtY: 0 });
+    routed.push({ arrow: a, srcSide, tgtSide, srcX: 0, srcY: 0, tgtX: 0, tgtY: 0, srcSlotIdx: 0, srcSlotCount: 1, tgtSlotIdx: 0, tgtSlotCount: 1 });
   }
 
   // Step 2: For each block+side, collect connected arrows and distribute points
@@ -807,9 +804,13 @@ function routeAndDrawArrows(parent: SVGGElement, arrows: Arrow[]): void {
       if (slots[i].isSource) {
         slots[i].ra.srcX = px;
         slots[i].ra.srcY = py;
+        slots[i].ra.srcSlotIdx = i;
+        slots[i].ra.srcSlotCount = count;
       } else {
         slots[i].ra.tgtX = px;
         slots[i].ra.tgtY = py;
+        slots[i].ra.tgtSlotIdx = i;
+        slots[i].ra.tgtSlotCount = count;
       }
     }
   }
@@ -826,23 +827,27 @@ function drawRoutedArrow(parent: SVGGElement, ra: RoutedArrow): void {
   const dx = x2 - x1;
   const dy = y2 - y1;
   const dist = Math.sqrt(dx * dx + dy * dy) || 1;
-  const cpDist = Math.max(30, Math.min(80, dist * 0.35));
+  const baseCpDist = Math.max(30, Math.min(80, dist * 0.35));
 
-  // Control points extend outward from the side
+  // Vary control point distance per slot to fan out parallel curves
+  const srcFan = ra.srcSlotCount > 1 ? (ra.srcSlotIdx - (ra.srcSlotCount - 1) / 2) * 14 : 0;
+  const tgtFan = ra.tgtSlotCount > 1 ? (ra.tgtSlotIdx - (ra.tgtSlotCount - 1) / 2) * 14 : 0;
+
+  // Control points extend outward from the side, with perpendicular fan offset
   let cp1x: number, cp1y: number, cp2x: number, cp2y: number;
 
   switch (srcSide) {
-    case 'right':  cp1x = x1 + cpDist; cp1y = y1; break;
-    case 'left':   cp1x = x1 - cpDist; cp1y = y1; break;
-    case 'bottom': cp1x = x1; cp1y = y1 + cpDist; break;
-    case 'top':    cp1x = x1; cp1y = y1 - cpDist; break;
+    case 'right':  cp1x = x1 + baseCpDist + Math.abs(srcFan) * 0.5; cp1y = y1 + srcFan; break;
+    case 'left':   cp1x = x1 - baseCpDist - Math.abs(srcFan) * 0.5; cp1y = y1 + srcFan; break;
+    case 'bottom': cp1x = x1 + srcFan; cp1y = y1 + baseCpDist + Math.abs(srcFan) * 0.5; break;
+    case 'top':    cp1x = x1 + srcFan; cp1y = y1 - baseCpDist - Math.abs(srcFan) * 0.5; break;
   }
 
   switch (tgtSide) {
-    case 'right':  cp2x = x2 + cpDist; cp2y = y2; break;
-    case 'left':   cp2x = x2 - cpDist; cp2y = y2; break;
-    case 'bottom': cp2x = x2; cp2y = y2 + cpDist; break;
-    case 'top':    cp2x = x2; cp2y = y2 - cpDist; break;
+    case 'right':  cp2x = x2 + baseCpDist + Math.abs(tgtFan) * 0.5; cp2y = y2 + tgtFan; break;
+    case 'left':   cp2x = x2 - baseCpDist - Math.abs(tgtFan) * 0.5; cp2y = y2 + tgtFan; break;
+    case 'bottom': cp2x = x2 + tgtFan; cp2y = y2 + baseCpDist + Math.abs(tgtFan) * 0.5; break;
+    case 'top':    cp2x = x2 + tgtFan; cp2y = y2 - baseCpDist - Math.abs(tgtFan) * 0.5; break;
   }
 
   const d = `M${x1},${y1} C${cp1x},${cp1y} ${cp2x},${cp2y} ${x2},${y2}`;
@@ -1012,6 +1017,38 @@ function drawIcon(g: SVGGElement, type: string, w: number, color: string): void 
   g.appendChild(ig);
 }
 
+// ─── Legend icon SVG helper ─────────────────────────────────────
+function legendIconHtml(type: string): string {
+  const c = THEMES[type]?.stroke || '#888';
+  const s = `stroke="${c}" fill="none" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"`;
+  switch (type) {
+    case 'test':
+      return `<svg width="14" height="14" viewBox="0 0 14 14"><path ${s} d="M5,1 h4 M6,1 v3.5 L3,10.5 a1.5,1.5,0,0,0,1.3,2.2 h5.4 a1.5,1.5,0,0,0,1.3-2.2 L8,4.5 v-3.5"/><polyline ${s} points="5.5,10 6.5,11 8.5,9"/></svg>`;
+    case 'env':
+      return `<svg width="14" height="14" viewBox="0 0 14 14"><path ${s} d="M7,13 v-5 Q7,3 12,2 Q11,8 7,8"/><path ${s} d="M7,10 Q3,4 2,2 Q7,3 7,8"/></svg>`;
+    case 'agent':
+      return `<svg width="14" height="14" viewBox="0 0 14 14"><rect ${s} x="1.5" y="5" width="11" height="8" rx="1.5"/><path ${s} d="M5,5 v-2 a1,1,0,0,1,1-1 h2 a1,1,0,0,1,1,1 v2"/><line ${s} x1="1.5" y1="9" x2="12.5" y2="9"/></svg>`;
+    case 'driver':
+      return `<svg width="14" height="14" viewBox="0 0 14 14"><path ${s} d="M2,4 h6 l-2,-2.5 M8,4 l-2,2.5"/><path ${s} d="M2,10 h6 l-2,-2.5 M8,10 l-2,2.5"/><line stroke="${c}" stroke-width="1.5" stroke-linecap="round" x1="10" y1="2" x2="10" y2="12"/></svg>`;
+    case 'monitor':
+      return `<svg width="14" height="14" viewBox="0 0 14 14"><rect ${s} x="1.5" y="1.5" width="11" height="8" rx="1.5"/><line ${s} x1="7" y1="9.5" x2="7" y2="12"/><line ${s} x1="4" y1="12" x2="10" y2="12"/><polyline ${s} points="3.5,5.5 5,3.5 6.5,7 8,4 9.5,6.5 11,4.5"/></svg>`;
+    case 'sequencer':
+      return `<svg width="14" height="14" viewBox="0 0 14 14"><polyline ${s} points="4,2 7,5 10,2"/><polyline ${s} points="4,5.5 7,8.5 10,5.5"/><polyline ${s} points="4,9 7,12 10,9"/></svg>`;
+    case 'scoreboard':
+      return `<svg width="14" height="14" viewBox="0 0 14 14"><line ${s} x1="7" y1="1.5" x2="7" y2="10"/><line ${s} x1="3" y1="3.5" x2="11" y2="3.5"/><path ${s} d="M3,3.5 L1.5,7.5 h3 z"/><path ${s} d="M11,3.5 L9.5,7.5 h3 z"/><polygon points="5,12 9,12 7,10" stroke="${c}" fill="${c}" opacity="0.3" stroke-width="1.2"/></svg>`;
+    case 'sequence':
+      return `<svg width="14" height="14" viewBox="0 0 14 14"><rect ${s} x="3" y="1" width="9" height="6" rx="1"/><rect ${s} x="1.5" y="3.5" width="9" height="6" rx="1"/><rect ${s} x="0" y="6" width="9" height="6" rx="1"/></svg>`;
+    case 'component':
+      return `<svg width="14" height="14" viewBox="0 0 14 14"><rect ${s} x="3.5" y="2" width="7" height="10" rx="1"/><line ${s} x1="1" y1="5" x2="3.5" y2="5"/><line ${s} x1="1" y1="9" x2="3.5" y2="9"/><line ${s} x1="10.5" y1="5" x2="13" y2="5"/><line ${s} x1="10.5" y1="9" x2="13" y2="9"/></svg>`;
+    case 'dut':
+      return `<svg width="14" height="14" viewBox="0 0 14 14"><rect ${s} x="3" y="2" width="8" height="10" rx="1"/><line ${s} x1="0" y1="4" x2="3" y2="4"/><line ${s} x1="0" y1="7" x2="3" y2="7"/><line ${s} x1="0" y1="10" x2="3" y2="10"/><line ${s} x1="11" y1="4" x2="14" y2="4"/><line ${s} x1="11" y1="7" x2="14" y2="7"/><line ${s} x1="11" y1="10" x2="14" y2="10"/><line ${s} x1="5" y1="0" x2="5" y2="2"/><line ${s} x1="9" y1="0" x2="9" y2="2"/></svg>`;
+    case 'object':
+      return `<svg width="14" height="14" viewBox="0 0 14 14"><path ${s} d="M2,1.5 h6.5 l3,3 v8 a1,1,0,0,1-1,1 h-8.5 a1,1,0,0,1-1-1 v-10 a1,1,0,0,1,1-1 z"/><path ${s} d="M8.5,1.5 v3 h3"/></svg>`;
+    default:
+      return `<svg width="14" height="14" viewBox="0 0 14 14"><rect ${s} x="2" y="2" width="10" height="10" rx="2"/></svg>`;
+  }
+}
+
 // ─── Legend (HTML overlay — never overlaps diagram) ────────────
 function drawLegendOverlay(): void {
   const container = document.getElementById('legend-overlay');
@@ -1031,6 +1068,7 @@ function drawLegendOverlay(): void {
     const th = THEMES[t];
     html += `<div class="legend-item">
       <span class="legend-swatch" style="background:${th.fill};border:1.5px solid ${th.stroke};"></span>
+      <span class="legend-icon-svg">${legendIconHtml(t)}</span>
       <span>${t}</span>
     </div>`;
   }
