@@ -90,6 +90,7 @@ export function regexParse(
     const fields = extractFields(body, line);
     const tlmPorts = extractTlmPorts(body);
     const connections = extractConnections(body);
+    const virtualIfs = extractVirtualInterfaces(body);
 
     uvmClasses.push({
       className,
@@ -100,6 +101,7 @@ export function regexParse(
       fields,
       tlmPorts,
       connections,
+      virtualIfs,
     });
   }
 
@@ -221,6 +223,21 @@ function extractConnections(classBody: string): TlmConnection[] {
     connections.push({ from: m[1], to: m[2] });
   }
   return connections;
+}
+
+function extractVirtualInterfaces(classBody: string): string[] {
+  // Match: virtual interface_name field;  or  virtual interface interface_name.modport field;
+  const re = /virtual\s+(?:interface\s+)?(\w+)(?:\.\w+)?\s+\w+/g;
+  const ifs: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(classBody)) !== null) {
+    const name = m[1];
+    // Skip UVM base types and SV keywords
+    if (!name.startsWith('uvm_') && !SV_KEYWORDS.has(name)) {
+      ifs.push(name);
+    }
+  }
+  return [...new Set(ifs)];
 }
 
 function extractFields(classBody: string, classStartLine: number): UvmField[] {

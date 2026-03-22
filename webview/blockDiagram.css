@@ -25,7 +25,28 @@ body {
   z-index: 100;
   display: flex;
   gap: 4px;
+  align-items: center;
 }
+
+#project-dropdown {
+  height: 28px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--vscode-dropdown-background, #333);
+  color: var(--vscode-dropdown-foreground, var(--fg));
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  margin-right: 8px;
+  max-width: 250px;
+}
+
+#project-dropdown:focus {
+  outline: 1px solid var(--vscode-focusBorder, #007fd4);
+}
+
+#legend-overlay:empty { display: none; }
 
 #toolbar button {
   width: 28px;

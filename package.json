@@ -2,7 +2,7 @@
   "name": "uvm-assistant",
   "displayName": "UVM-Assistant",
   "description": "Analyzes Verilog/SystemVerilog workspaces to visualize module hierarchy, UVM class hierarchy, and UVM block diagrams.",
-  "version": "1.1.0",
+  "version": "1.5.0",
   "publisher": "uvm-assistant",
   "license": "MIT",
   "engines": {
@@ -35,11 +35,11 @@
     "views": {
       "uvm-assistant-explorer": [
         {
-          "id": "moduleHierarchy",
+          "id": "uvm-assistant.moduleHierarchy",
           "name": "Module Hierarchy"
         },
         {
-          "id": "uvmClassHierarchy",
+          "id": "uvm-assistant.uvmClassHierarchy",
           "name": "UVM Classes"
         }
       ]
@@ -73,17 +73,17 @@
       "view/title": [
         {
           "command": "uvm-assistant.openBlockDiagram",
-          "when": "view == uvmClassHierarchy",
+          "when": "view == uvm-assistant.uvmClassHierarchy",
           "group": "navigation"
         },
         {
           "command": "uvm-assistant.openDataFlowDiagram",
-          "when": "view == uvmClassHierarchy",
+          "when": "view == uvm-assistant.uvmClassHierarchy",
           "group": "navigation"
         },
         {
           "command": "uvm-assistant.refresh",
-          "when": "view == moduleHierarchy || view == uvmClassHierarchy",
+          "when": "view == uvm-assistant.moduleHierarchy || view == uvm-assistant.uvmClassHierarchy",
           "group": "navigation"
         }
       ]

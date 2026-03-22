@@ -3,9 +3,10 @@ import { FileScanner } from './fileScanner';
 import { SvParser, ParseResult } from './parser/svParser';
 import { ModuleHierarchyProvider } from './views/moduleHierarchyProvider';
 import { UvmClassProvider } from './views/uvmClassProvider';
-import { UvmDiagramPanel } from './views/uvmDiagramPanel';
+import { UvmDiagramPanel, SerializedProject, serializeUvmTree } from './views/uvmDiagramPanel';
 import { runUvmLinter, toVscodeSeverity } from './linter/uvmLinter';
 import { VeribleFormattingProvider } from './formatter/veribleFormatter';
+import { TestbenchProject, UvmNode, DutInfo } from './models/uvmNode';
 
 let fileScanner: FileScanner;
 let svParser: SvParser;
@@ -14,6 +15,27 @@ let uvmProvider: UvmClassProvider;
 let lastResult: ParseResult | undefined;
 let diagnosticCollection: vscode.DiagnosticCollection;
 let debounceTimer: ReturnType<typeof setTimeout> | undefined;
+
+/**
+ * Build the serialized project list to pass to the webview.
+ * If multiple sub-projects exist, each becomes a selectable entry.
+ * Otherwise, the full workspace results become a single entry.
+ */
+function buildProjectList(result: ParseResult): SerializedProject[] {
+  if (result.projects.length > 1) {
+    return result.projects.map(p => ({
+      name: p.name,
+      roots: serializeUvmTree(p.uvmRoots),
+      duts: p.duts.map(d => ({ ...d })),
+    }));
+  }
+  // Single project — wrap full results
+  return [{
+    name: 'Default',
+    roots: serializeUvmTree(result.uvmRoots),
+    duts: result.duts.map(d => ({ ...d })),
+  }];
+}
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const extensionUri = context.extensionUri;
@@ -28,26 +50,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // Register tree views
   context.subscriptions.push(
-    vscode.window.registerTreeDataProvider('moduleHierarchy', moduleProvider),
-    vscode.window.registerTreeDataProvider('uvmClassHierarchy', uvmProvider),
+    vscode.window.registerTreeDataProvider('uvm-assistant.moduleHierarchy', moduleProvider),
+    vscode.window.registerTreeDataProvider('uvm-assistant.uvmClassHierarchy', uvmProvider),
   );
 
   // Register commands
   context.subscriptions.push(
     vscode.commands.registerCommand('uvm-assistant.refresh', () => runAnalysis(extensionUri)),
-    vscode.commands.registerCommand('uvm-assistant.openBlockDiagram', () => {
-      if (lastResult) {
-        UvmDiagramPanel.createOrShow(extensionUri, lastResult.uvmRoots, 'block');
-      } else {
+    vscode.commands.registerCommand('uvm-assistant.openBlockDiagram', async () => {
+      if (!lastResult) {
         vscode.window.showInformationMessage('UVM-Assistant: Run analysis first (click Refresh).');
+        return;
       }
+      const projects = buildProjectList(lastResult);
+      UvmDiagramPanel.createOrShow(extensionUri, projects, 'block');
     }),
-    vscode.commands.registerCommand('uvm-assistant.openDataFlowDiagram', () => {
-      if (lastResult) {
-        UvmDiagramPanel.createOrShow(extensionUri, lastResult.uvmRoots, 'dataflow');
-      } else {
+    vscode.commands.registerCommand('uvm-assistant.openDataFlowDiagram', async () => {
+      if (!lastResult) {
         vscode.window.showInformationMessage('UVM-Assistant: Run analysis first (click Refresh).');
+        return;
       }
+      const projects = buildProjectList(lastResult);
+      UvmDiagramPanel.createOrShow(extensionUri, projects, 'dataflow');
     }),
     vscode.commands.registerCommand('uvm-assistant.formatDocument', async () => {
       const editor = vscode.window.activeTextEditor;

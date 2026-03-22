@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { ModuleNode, ModuleInstance } from '../models/moduleNode';
-import { UvmClassInfo, UvmNode } from '../models/uvmNode';
+import { UvmClassInfo, UvmNode, DutInfo, TestbenchProject } from '../models/uvmNode';
 import { initTreeSitter } from './treeSitterInit';
 import { regexParse } from './regexFallback';
 import { classifyUvmBase } from '../utils/uvmClassifier';
@@ -15,6 +15,10 @@ export interface ParseResult {
   allUvmClasses: Map<string, UvmClassInfo>;
   /** Raw file texts keyed by fsPath, so downstream consumers don't re-read */
   fileTexts: Map<string, string>;
+  /** DUT modules detected from testbench top instantiations */
+  duts: DutInfo[];
+  /** Detected testbench projects (grouped by directory) */
+  projects: TestbenchProject[];
 }
 
 export class SvParser {
@@ -60,8 +64,10 @@ export class SvParser {
 
     const moduleRoots = buildModuleHierarchy(allModules);
     const uvmRoots = buildUvmHierarchy(allUvmClasses);
+    const duts = detectDuts(allModules, fileTexts);
+    const projects = detectProjects(files, allUvmClasses, allModules, fileTexts);
 
-    return { moduleRoots, allModules, uvmRoots, allUvmClasses, fileTexts };
+    return { moduleRoots, allModules, uvmRoots, allUvmClasses, fileTexts, duts, projects };
   }
 
   private parseWithTreeSitter(
@@ -105,6 +111,7 @@ export class SvParser {
             fields: [],
             tlmPorts: [],
             connections: [],
+            virtualIfs: [],
           });
         }
       }
@@ -132,6 +139,7 @@ export class SvParser {
         if (existing.fields.length === 0) { existing.fields = cls.fields; }
         if (existing.tlmPorts.length === 0) { existing.tlmPorts = cls.tlmPorts; }
         if (existing.connections.length === 0) { existing.connections = cls.connections; }
+        if (existing.virtualIfs.length === 0) { existing.virtualIfs = cls.virtualIfs; }
       }
     }
 
@@ -217,6 +225,7 @@ function buildUvmHierarchy(allClasses: Map<string, UvmClassInfo>): UvmNode[] {
       children: [],
       tlmPorts: cls.tlmPorts,
       connections: cls.connections,
+      virtualIfs: cls.virtualIfs,
     });
   }
 
@@ -246,6 +255,24 @@ function buildUvmHierarchy(allClasses: Map<string, UvmClassInfo>): UvmNode[] {
     }
   }
 
+  // ── Transitive type resolution ──
+  // If class A extends class B (via baseClass), and B is known, propagate the type to A.
+  // Repeat until no more changes (handles chains like test1 → ram_test → uvm_test).
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const node of nodeMap.values()) {
+      if (node.uvmType !== 'unknown') continue;
+      // Strip parameterization from base class to get the raw class name
+      const rawBase = node.baseClass.replace(/\s*#\s*\(.*\)/, '').trim();
+      const parent = nodeMap.get(rawBase);
+      if (parent && parent.uvmType !== 'unknown') {
+        node.uvmType = parent.uvmType;
+        changed = true;
+      }
+    }
+  }
+
   // Sort: tests first, then envs, then the rest
   roots.sort((a, b) => {
     const order: Record<string, number> = { test: 0, env: 1 };
@@ -253,4 +280,128 @@ function buildUvmHierarchy(allClasses: Map<string, UvmClassInfo>): UvmNode[] {
   });
 
   return roots.length > 0 ? roots : [...nodeMap.values()];
+}
+
+/**
+ * Detect DUT modules by finding modules instantiated in testbench top modules.
+ * A testbench top is identified by containing a `run_test()` call.
+ */
+function detectDuts(allModules: Map<string, ModuleNode>, fileTexts: Map<string, string>): DutInfo[] {
+  // Find testbench top files (files containing run_test())
+  const tbTopFiles = new Set<string>();
+  for (const [filePath, text] of fileTexts) {
+    if (/\brun_test\s*\(/.test(text)) {
+      tbTopFiles.add(filePath);
+    }
+  }
+
+  // Find modules in testbench top files — these are testbench top modules
+  const tbTopModules = new Set<string>();
+  for (const mod of allModules.values()) {
+    if (tbTopFiles.has(mod.filePath)) {
+      tbTopModules.add(mod.name);
+    }
+  }
+
+  // DUTs are modules instantiated by testbench top modules
+  const duts: DutInfo[] = [];
+  const seen = new Set<string>();
+  for (const tbName of tbTopModules) {
+    const tb = allModules.get(tbName);
+    if (!tb) continue;
+    for (const inst of tb.instances) {
+      // Skip if it's another testbench top or already seen
+      if (tbTopModules.has(inst.moduleName) || seen.has(inst.moduleName)) continue;
+      seen.add(inst.moduleName);
+
+      const mod = allModules.get(inst.moduleName);
+      duts.push({
+        moduleName: inst.moduleName,
+        instanceName: inst.instanceName,
+        filePath: mod?.filePath ?? inst.filePath,
+        line: mod?.line ?? inst.line,
+      });
+    }
+  }
+  return duts;
+}
+
+/**
+ * Detect separate testbench projects by grouping files by directory structure.
+ * Each project directory that contains UVM classes gets its own hierarchy.
+ */
+function detectProjects(
+  files: vscode.Uri[],
+  allClasses: Map<string, UvmClassInfo>,
+  allModules: Map<string, ModuleNode>,
+  fileTexts: Map<string, string>,
+): TestbenchProject[] {
+  if (files.length === 0) return [];
+
+  // Find common path prefix of all files
+  const paths = files.map(f => f.fsPath);
+  const commonPrefix = findCommonPathPrefix(paths);
+
+  // Group files by first directory component after the common prefix
+  const dirGroups = new Map<string, Set<string>>();
+  for (const p of paths) {
+    const relative = p.slice(commonPrefix.length);
+    const parts = relative.split('/').filter(s => s.length > 0);
+    const groupKey = parts.length > 1 ? parts[0] : '__root__';
+    const set = dirGroups.get(groupKey) || new Set();
+    set.add(p);
+    dirGroups.set(groupKey, set);
+  }
+
+  // If only one group, return a single project with the full hierarchy
+  if (dirGroups.size <= 1) return [];
+
+  // Build a separate project for each directory group
+  const projects: TestbenchProject[] = [];
+  for (const [dirName, filePaths] of dirGroups) {
+    // Filter classes belonging to this group
+    const groupClasses = new Map<string, UvmClassInfo>();
+    for (const [name, cls] of allClasses) {
+      if (filePaths.has(cls.filePath)) {
+        groupClasses.set(name, cls);
+      }
+    }
+    if (groupClasses.size === 0) continue;
+
+    const uvmRoots = buildUvmHierarchy(groupClasses);
+    const groupDuts = detectDuts(
+      new Map([...allModules].filter(([, m]) => filePaths.has(m.filePath))),
+      new Map([...fileTexts].filter(([fp]) => filePaths.has(fp))),
+    );
+
+    const name = dirName === '__root__' ? 'Default' : dirName.replace(/[_-]/g, ' ');
+    const rootDir = dirName === '__root__' ? commonPrefix : commonPrefix + dirName;
+
+    projects.push({ name, rootDir, uvmRoots, duts: groupDuts });
+  }
+
+  // Only return multiple projects if there actually are multiple
+  return projects.length > 1 ? projects : [];
+}
+
+function findCommonPathPrefix(paths: string[]): string {
+  if (paths.length === 0) return '';
+  if (paths.length === 1) {
+    const last = paths[0].lastIndexOf('/');
+    return last >= 0 ? paths[0].slice(0, last + 1) : '';
+  }
+  let prefix = paths[0];
+  for (let i = 1; i < paths.length; i++) {
+    while (!paths[i].startsWith(prefix)) {
+      const slash = prefix.lastIndexOf('/', prefix.length - 2);
+      if (slash < 0) return '';
+      prefix = prefix.slice(0, slash + 1);
+    }
+  }
+  // Ensure prefix ends at a directory boundary
+  if (!prefix.endsWith('/')) {
+    const slash = prefix.lastIndexOf('/');
+    prefix = slash >= 0 ? prefix.slice(0, slash + 1) : '';
+  }
+  return prefix;
 }

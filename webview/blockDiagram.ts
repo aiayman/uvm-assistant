@@ -12,6 +12,19 @@ interface UvmDiagramNode {
   children: UvmDiagramNode[];
 }
 
+interface DutInfo {
+  moduleName: string;
+  instanceName: string;
+  filePath: string;
+  line: number;
+}
+
+interface ProjectData {
+  name: string;
+  roots: UvmDiagramNode[];
+  duts: DutInfo[];
+}
+
 const vscode = (window as any).acquireVsCodeApi();
 
 // ─── Layout constants ─────────────────────────────────────────
@@ -44,6 +57,10 @@ let svgEl: SVGSVGElement;
 let rootG: SVGGElement;
 let currentTransform = { x: 0, y: 0, k: 1 };
 
+// ─── Project state ────────────────────────────────────────────
+let allProjects: ProjectData[] = [];
+let selectedProjectIndex = 0;
+
 // ─── Init ─────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
   svgEl = document.getElementById('diagram') as unknown as SVGSVGElement;
@@ -55,15 +72,56 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-zoom-out')?.addEventListener('click', () => zoom(0.8));
   document.getElementById('btn-reset')?.addEventListener('click', resetView);
 
+  // Project dropdown change handler
+  const dropdown = document.getElementById('project-dropdown') as HTMLSelectElement | null;
+  if (dropdown) {
+    dropdown.addEventListener('change', () => {
+      selectedProjectIndex = dropdown.selectedIndex;
+      if (allProjects[selectedProjectIndex]) {
+        render(allProjects[selectedProjectIndex].roots);
+      }
+    });
+  }
+
   vscode.postMessage({ command: 'ready' });
 });
 
 // ─── Messages ─────────────────────────────────────────────────
 window.addEventListener('message', (event) => {
   if (event.data.command === 'renderDiagram') {
-    render(event.data.data as UvmDiagramNode[]);
+    const projects: ProjectData[] = event.data.projects || [];
+    allProjects = projects;
+    selectedProjectIndex = 0;
+    updateProjectDropdown();
+
+    if (projects.length > 0) {
+      render(projects[selectedProjectIndex].roots);
+    } else {
+      render([]);
+    }
   }
 });
+
+// ─── Project dropdown ─────────────────────────────────────────
+function updateProjectDropdown(): void {
+  const dropdown = document.getElementById('project-dropdown') as HTMLSelectElement | null;
+  if (!dropdown) return;
+
+  if (allProjects.length <= 1) {
+    dropdown.style.display = 'none';
+    return;
+  }
+
+  dropdown.style.display = 'block';
+  dropdown.innerHTML = '';
+  for (let i = 0; i < allProjects.length; i++) {
+    const opt = document.createElement('option');
+    opt.value = String(i);
+    opt.textContent = allProjects[i].name;
+    if (i === selectedProjectIndex) opt.selected = true;
+    dropdown.appendChild(opt);
+  }
+}
 
 // ─── Render ───────────────────────────────────────────────────
 function render(roots: UvmDiagramNode[]): void {

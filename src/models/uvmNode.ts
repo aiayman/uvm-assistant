@@ -43,6 +43,7 @@ export interface UvmNode {
   children: UvmNode[];
   tlmPorts: TlmPort[];
   connections: TlmConnection[];
+  virtualIfs: string[];
 }
 
 export interface UvmField {
@@ -61,4 +62,26 @@ export interface UvmClassInfo {
   fields: UvmField[];
   tlmPorts: TlmPort[];
   connections: TlmConnection[];
+  /** Virtual interface type names used by this class (e.g. "spi_m_interface") */
+  virtualIfs: string[];
+}
+
+/** DUT module detected from testbench top */
+export interface DutInfo {
+  moduleName: string;
+  instanceName: string;
+  filePath: string;
+  line: number;
+}
+
+/** A distinct testbench project within the workspace */
+export interface TestbenchProject {
+  /** Human-readable name derived from the directory */
+  name: string;
+  /** Root directory path for this project */
+  rootDir: string;
+  /** UVM class tree roots scoped to this project */
+  uvmRoots: UvmNode[];
+  /** DUT modules scoped to this project */
+  duts: DutInfo[];
 }

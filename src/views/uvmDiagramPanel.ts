@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import * as crypto from 'crypto';
-import { UvmNode, TlmPort, TlmConnection } from '../models/uvmNode';
+import { UvmNode, TlmPort, TlmConnection, DutInfo, TestbenchProject } from '../models/uvmNode';
 
 export type DiagramMode = 'block' | 'dataflow';
 
@@ -8,7 +8,7 @@ export class UvmDiagramPanel {
   private static panels = new Map<DiagramMode, UvmDiagramPanel>();
   private readonly panel: vscode.WebviewPanel;
   private disposables: vscode.Disposable[] = [];
-  private pendingData: SerializedUvmNode[] | undefined;
+  private pendingData: DiagramPayload | undefined;
   private readonly mode: DiagramMode;
 
   private constructor(
@@ -37,13 +37,17 @@ export class UvmDiagramPanel {
     );
   }
 
-  static createOrShow(extensionUri: vscode.Uri, uvmRoots: UvmNode[], mode: DiagramMode = 'block'): void {
+  static createOrShow(
+    extensionUri: vscode.Uri,
+    projects: SerializedProject[],
+    mode: DiagramMode = 'block',
+  ): void {
     const column = vscode.window.activeTextEditor?.viewColumn ?? vscode.ViewColumn.One;
     const existing = UvmDiagramPanel.panels.get(mode);
 
     if (existing) {
       existing.panel.reveal(column);
-      existing.updateDiagram(uvmRoots);
+      existing.updateDiagram(projects);
       return;
     }
 
@@ -66,19 +70,19 @@ export class UvmDiagramPanel {
 
     const instance = new UvmDiagramPanel(panel, extensionUri, mode);
     UvmDiagramPanel.panels.set(mode, instance);
-    instance.updateDiagram(uvmRoots);
+    instance.updateDiagram(projects);
   }
 
-  updateDiagram(uvmRoots: UvmNode[]): void {
-    this.pendingData = serializeUvmTree(uvmRoots);
-        this.panel.webview.html = this.getHtml(this.panel.webview);
+  updateDiagram(projects: SerializedProject[]): void {
+    this.pendingData = { projects };
+    this.panel.webview.html = this.getHtml(this.panel.webview);
   }
 
   private flushPendingData(): void {
     if (this.pendingData) {
       this.panel.webview.postMessage({
         command: 'renderDiagram',
-        data: this.pendingData,
+        projects: this.pendingData.projects,
       });
       this.pendingData = undefined;
     }
@@ -113,6 +117,7 @@ export class UvmDiagramPanel {
 </head>
 <body>
   <div id="toolbar">
+    <select id="project-dropdown" style="display:none;"></select>
     <button id="btn-zoom-in" title="Zoom In">+</button>
     <button id="btn-zoom-out" title="Zoom Out">&minus;</button>
     <button id="btn-reset" title="Reset View">&odot;</button>
@@ -120,6 +125,7 @@ export class UvmDiagramPanel {
   <div id="diagram-container">
     <svg id="diagram"></svg>
   </div>
+  <div id="legend-overlay"></div>
   <div id="empty-state" style="display:none;">
     <p>No UVM components found in the workspace.</p>
     <p>Open a folder containing SystemVerilog files with UVM classes and click Refresh.</p>
@@ -137,6 +143,21 @@ export class UvmDiagramPanel {
   }
 }
 
+export interface SerializedProject {
+  name: string;
+  roots: SerializedUvmNode[];
+  duts: DutInfo[];
+}
+
+interface DiagramPayload {
+  projects: SerializedProject[];
+}
+
+interface SerializedField {
+  typeName: string;
+  fieldName: string;
+}
+
 interface SerializedUvmNode {
   className: string;
   uvmType: string;
@@ -144,11 +165,13 @@ interface SerializedUvmNode {
   filePath: string;
   line: number;
   children: SerializedUvmNode[];
+  fields: SerializedField[];
   tlmPorts: TlmPort[];
   connections: TlmConnection[];
+  virtualIfs: string[];
 }
 
-function serializeUvmTree(roots: UvmNode[]): SerializedUvmNode[] {
+export function serializeUvmTree(roots: UvmNode[]): SerializedUvmNode[] {
   const visited = new Set<string>();
   function serialize(node: UvmNode): SerializedUvmNode | null {
     if (visited.has(node.className)) { return null; }
@@ -160,8 +183,10 @@ function serializeUvmTree(roots: UvmNode[]): SerializedUvmNode[] {
       filePath: node.filePath,
       line: node.line,
       children: node.children.map(serialize).filter((n): n is SerializedUvmNode => n !== null),
+      fields: node.fields.map(f => ({ typeName: f.typeName, fieldName: f.fieldName })),
       tlmPorts: node.tlmPorts,
       connections: node.connections,
+      virtualIfs: node.virtualIfs,
     };
   }
   return roots.map(serialize).filter((n): n is SerializedUvmNode => n !== null);
