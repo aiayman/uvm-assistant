@@ -702,7 +702,7 @@ function drawAllConnections(parent: SVGGElement, roots: UvmDiagramNode[]): void 
         const seqrB = findBlockByClass(seqr.className);
         if (drvB && seqrB && !arrows.some(a =>
           (a.from === drvB && a.to === seqrB) || (a.from === seqrB && a.to === drvB))) {
-          arrows.push({ from: seqrB, to: drvB, label: 'seq_item_port', color: '#c586c0', marker: 'ah-seq', dashed: false });
+          arrows.push({ from: seqrB, to: drvB, label: 'seq_item_port', color: '#c586c0', marker: 'ah-seq', dashed: false, filePath: drv.filePath, line: drv.line });
         }
       }
     }
@@ -735,9 +735,9 @@ function drawAllConnections(parent: SVGGElement, roots: UvmDiagramNode[]): void 
       const dut = dutBlocks.length === 1 ? dutBlocks[0] : nearest(comp.block, dutBlocks);
 
       if (comp.node.uvmType === 'driver') {
-        arrows.push({ from: comp.block, to: dut, label, color: '#e6b422', marker: 'ah-dut', dashed: true });
+        arrows.push({ from: comp.block, to: dut, label, color: '#e6b422', marker: 'ah-dut', dashed: true, filePath: comp.node.filePath, line: comp.node.line });
       } else {
-        arrows.push({ from: dut, to: comp.block, label, color: '#e6b422', marker: 'ah-dut', dashed: true });
+        arrows.push({ from: dut, to: comp.block, label, color: '#e6b422', marker: 'ah-dut', dashed: true, filePath: comp.node.filePath, line: comp.node.line });
       }
     }
   }
@@ -749,13 +749,13 @@ function drawAllConnections(parent: SVGGElement, roots: UvmDiagramNode[]): void 
     if (!arrows.some(a => a.to === sb)) {
       for (const ag of agentBlocks) {
         if (ag.node.tlmPorts.some(p => p.kind.includes('analysis'))) {
-          arrows.push({ from: ag, to: sb, label: 'analysis_port', color: '#d16969', marker: 'ah-ap', dashed: false });
+          arrows.push({ from: ag, to: sb, label: 'analysis_port', color: '#d16969', marker: 'ah-ap', dashed: false, filePath: ag.node.filePath, line: ag.node.line });
         }
       }
       if (!arrows.some(a => a.to === sb)) {
         const monBlocks = drawnBlocks.filter(b => b.node.uvmType === 'monitor' && b.node.tlmPorts.some(p => p.kind.includes('analysis')));
         for (const mon of monBlocks) {
-          arrows.push({ from: mon, to: sb, label: 'analysis_port', color: '#d16969', marker: 'ah-ap', dashed: false });
+          arrows.push({ from: mon, to: sb, label: 'analysis_port', color: '#d16969', marker: 'ah-ap', dashed: false, filePath: mon.node.filePath, line: mon.node.line });
         }
       }
     }
@@ -944,16 +944,28 @@ function computeOrthoPath(ra: RoutedArrow): void {
   if (srcSide === 'right' && tgtSide === 'left') {
     ra.waypoints = routeHorizontal(x1, y1, x2, y2, obs);
   } else if (srcSide === 'left' && tgtSide === 'right') {
-    ra.waypoints = routeBackwards(x1, y1, x2, y2);
+    ra.waypoints = routeBackwards(x1, y1, x2, y2, obs);
   } else if ((srcSide === 'bottom' && tgtSide === 'top') ||
              (srcSide === 'top' && tgtSide === 'bottom')) {
-    ra.waypoints = routeVertical(x1, y1, x2, y2);
+    ra.waypoints = routeVertical(x1, y1, x2, y2, obs);
   } else {
+    // Mixed sides: L-shape with collision check
     const pts: Pt[] = [{ x: x1, y: y1 }];
     if (srcSide === 'right' || srcSide === 'left') {
-      pts.push({ x: x2, y: y1 });
+      const midPt = { x: x2, y: y1 };
+      if (hSegHitsBlock(x1, x2, y1, obs) || vSegHitsBlock(x2, y1, y2, obs)) {
+        // Fall back to Z-shape routing
+        ra.waypoints = routeHorizontal(x1, y1, x2, y2, obs);
+        return;
+      }
+      pts.push(midPt);
     } else {
-      pts.push({ x: x1, y: y2 });
+      const midPt = { x: x1, y: y2 };
+      if (vSegHitsBlock(x1, y1, y2, obs) || hSegHitsBlock(x1, x2, y2, obs)) {
+        ra.waypoints = routeVertical(x1, y1, x2, y2, obs);
+        return;
+      }
+      pts.push(midPt);
     }
     pts.push({ x: x2, y: y2 });
     ra.waypoints = pts;
@@ -1014,7 +1026,7 @@ function routeDetour(x1: number, y1: number, x2: number, y2: number, obs: BlockR
   ];
 }
 
-function routeBackwards(x1: number, y1: number, x2: number, y2: number): Pt[] {
+function routeBackwards(x1: number, y1: number, x2: number, y2: number, obs: BlockRect[]): Pt[] {
   const allMinY = drawnBlocks.length > 0
     ? Math.min(...drawnBlocks.map(b => b.y), y1, y2) : Math.min(y1, y2);
   let routeY = Math.round(allMinY - 30);
@@ -1024,16 +1036,43 @@ function routeBackwards(x1: number, y1: number, x2: number, y2: number): Pt[] {
   }
   const exitX = Math.round(x1 - 15);
   const entryX = Math.round(x2 + 15);
+
+  // Find clear vertical channels for the exit and entry
+  const vx1 = vSegHitsBlock(exitX, y1, routeY, obs)
+    ? findClearVChannel(x1 - 40, x1, y1, routeY, obs) : exitX;
+  const vx2 = vSegHitsBlock(entryX, y2, routeY, obs)
+    ? findClearVChannel(x2, x2 + 40, y2, routeY, obs) : entryX;
+
   return [
-    { x: x1, y: y1 }, { x: exitX, y: y1 },
-    { x: exitX, y: routeY }, { x: entryX, y: routeY },
-    { x: entryX, y: y2 }, { x: x2, y: y2 },
+    { x: x1, y: y1 }, { x: vx1, y: y1 },
+    { x: vx1, y: routeY }, { x: vx2, y: routeY },
+    { x: vx2, y: y2 }, { x: x2, y: y2 },
   ];
 }
 
-function routeVertical(x1: number, y1: number, x2: number, y2: number): Pt[] {
-  if (Math.abs(x1 - x2) < 2) return [{ x: x1, y: y1 }, { x: x2, y: y2 }];
+function routeVertical(x1: number, y1: number, x2: number, y2: number, obs: BlockRect[]): Pt[] {
+  if (Math.abs(x1 - x2) < 2) {
+    if (!vSegHitsBlock(x1, y1, y2, obs)) return [{ x: x1, y: y1 }, { x: x2, y: y2 }];
+  }
   const midY = Math.round((y1 + y2) / 2);
+  // Check if the Z-shape hits any blocks
+  if (!vSegHitsBlock(x1, y1, midY, obs) && !hSegHitsBlock(x1, x2, midY, obs) && !vSegHitsBlock(x2, midY, y2, obs)) {
+    return [{ x: x1, y: y1 }, { x: x1, y: midY }, { x: x2, y: midY }, { x: x2, y: y2 }];
+  }
+  // Try routing above or below the obstacles
+  const yMin = Math.min(y1, y2), yMax = Math.max(y1, y2);
+  const blockers = obs.filter(b => b.x + b.w > Math.min(x1, x2) - 4 && b.x < Math.max(x1, x2) + 4 && b.y + b.h > yMin && b.y < yMax);
+  if (blockers.length > 0) {
+    const clearAbove = Math.min(...blockers.map(b => b.y)) - BLOCK_ARROW_GAP;
+    const clearBelow = Math.max(...blockers.map(b => b.y + b.h)) + BLOCK_ARROW_GAP;
+    const useAbove = Math.abs(clearAbove - (y1 + y2) / 2) < Math.abs(clearBelow - (y1 + y2) / 2);
+    const detourY = useAbove ? clearAbove : clearBelow;
+    if (containerBounds) {
+      const clampedY = Math.max(containerBounds.y + HEADER_H + 6, Math.min(containerBounds.y + containerBounds.h - 6, detourY));
+      return [{ x: x1, y: y1 }, { x: x1, y: clampedY }, { x: x2, y: clampedY }, { x: x2, y: y2 }];
+    }
+    return [{ x: x1, y: y1 }, { x: x1, y: detourY }, { x: x2, y: detourY }, { x: x2, y: y2 }];
+  }
   return [{ x: x1, y: y1 }, { x: x1, y: midY }, { x: x2, y: midY }, { x: x2, y: y2 }];
 }
 
@@ -1094,6 +1133,24 @@ function spreadOverlapping(segs: SegInfo[], routed: RoutedArrow[], axis: 'v' | '
 function drawOrthoArrow(parent: SVGGElement, ra: RoutedArrow): void {
   const { arrow: a, waypoints: pts } = ra;
   if (pts.length < 2) return;
+
+  // Ensure the last segment is long enough for the arrowhead to be visible.
+  // The marker is 8 units with refX=7, so we need at least ~12px for clarity.
+  const MIN_LAST_SEG = 14;
+  if (pts.length >= 3) {
+    const last = pts[pts.length - 1];
+    const prev = pts[pts.length - 2];
+    const dx = last.x - prev.x, dy = last.y - prev.y;
+    const segLen = Math.sqrt(dx * dx + dy * dy);
+    if (segLen > 0 && segLen < MIN_LAST_SEG) {
+      // Extend the previous waypoint away from the endpoint to lengthen the last segment
+      const scale = MIN_LAST_SEG / segLen;
+      pts[pts.length - 2] = {
+        x: last.x - dx * scale,
+        y: last.y - dy * scale,
+      };
+    }
+  }
 
   // Port circle at source (connection point on block border)
   parent.appendChild(attrs(el('circle'), {
