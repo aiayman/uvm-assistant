@@ -95,6 +95,9 @@ interface BlockRect {
   stage: number;
 }
 let drawnBlocks: BlockRect[] = [];
+let connectionCounts: Map<string, number> = new Map();
+const MIN_CONN_SLOT = 16;
+const CONN_MARGIN = 12;
 
 // ─── Project state ────────────────────────────────────────────
 let allProjects: ProjectData[] = [];
@@ -188,6 +191,62 @@ function updateProjectDropdown(): void {
   }
 }
 
+// ─── Connection count estimation ─────────────────────────────
+function estimateConnectionCounts(roots: UvmDiagramNode[], duts: DutInfo[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  const inc = (name: string) => counts.set(name, (counts.get(name) || 0) + 1);
+
+  const processConns = (node: UvmDiagramNode) => {
+    for (const conn of node.connections) {
+      const srcClass = resolveFieldToClass(node, conn.from.split('.')[0]);
+      const dstClass = resolveFieldToClass(node, conn.to.split('.')[0]);
+      if (srcClass) inc(srcClass);
+      if (dstClass) inc(dstClass);
+    }
+    for (const ch of node.children) processConns(ch);
+  };
+  for (const r of roots) processConns(r);
+
+  const inferAgent = (node: UvmDiagramNode) => {
+    if (node.uvmType === 'agent') {
+      const drv = node.children.find(c => c.uvmType === 'driver');
+      const seqr = node.children.find(c => c.uvmType === 'sequencer');
+      if (drv && seqr) { inc(drv.className); inc(seqr.className); }
+    }
+    for (const ch of node.children) inferAgent(ch);
+  };
+  for (const r of roots) inferAgent(r);
+
+  if (duts.length > 0) {
+    const collectDM = (n: UvmDiagramNode) => {
+      if (n.uvmType === 'driver' || n.uvmType === 'monitor') {
+        inc(n.className);
+        for (const d of duts) inc(d.moduleName);
+      }
+      for (const ch of n.children) collectDM(ch);
+    };
+    for (const r of roots) collectDM(r);
+  }
+
+  const sbNames: string[] = [];
+  const apNames: string[] = [];
+  const collectSbAp = (n: UvmDiagramNode) => {
+    if (n.uvmType === 'scoreboard') sbNames.push(n.className);
+    if ((n.uvmType === 'monitor' || n.uvmType === 'agent') &&
+        n.tlmPorts.some(p => p.kind.includes('analysis'))) apNames.push(n.className);
+    for (const ch of n.children) collectSbAp(ch);
+  };
+  for (const r of roots) collectSbAp(r);
+  for (const sb of sbNames) {
+    for (const _ap of apNames) { inc(sb); }
+  }
+  for (const ap of apNames) {
+    for (const _sb of sbNames) { inc(ap); }
+  }
+
+  return counts;
+}
+
 // ─── Render (pipeline layout) ─────────────────────────────────
 function renderProject(roots: UvmDiagramNode[], duts: DutInfo[]): void {
   const empty = document.getElementById('empty-state')!;
@@ -255,6 +314,9 @@ function renderProject(roots: UvmDiagramNode[], duts: DutInfo[]): void {
     g.members.sort((a, b) => (STAGE[a.uvmType] ?? 99) - (STAGE[b.uvmType] ?? 99));
   }
 
+  // Estimate connection counts for block sizing
+  connectionCounts = estimateConnectionCounts(roots, duts);
+
   // ── Build the pipeline layout ──
   const envNode = roots.find(r => r.uvmType === 'test')?.children.find(c => c.uvmType === 'env')
     || roots.find(r => r.uvmType === 'env');
@@ -282,7 +344,10 @@ function renderProject(roots: UvmDiagramNode[], duts: DutInfo[]): void {
 
   // Add DUTs between agents
   for (const dut of duts) {
-    layoutBlocks.push({ type: 'dut', stage: 3, w: DUT_W, h: DUT_H, data: dut });
+    const dutConnCount = connectionCounts.get(dut.moduleName) || 0;
+    const dutConnH = dutConnCount > 1 ? dutConnCount * MIN_CONN_SLOT + 2 * CONN_MARGIN : 0;
+    const dutH = Math.max(DUT_H, dutConnH);
+    layoutBlocks.push({ type: 'dut', stage: 3, w: DUT_W, h: dutH, data: dut });
   }
 
   // Separate sequences from other standalone leaves and group them vertically
@@ -376,7 +441,10 @@ function renderProject(roots: UvmDiagramNode[], duts: DutInfo[]): void {
 function measureLeaf(node: UvmDiagramNode): { w: number; h: number } {
   const textW = node.className.length * CHAR_W + PAD * 2 + ICON_SIZE + 8;
   const portH = node.tlmPorts.length > 0 ? PORT_AREA_H : 0;
-  return { w: Math.max(BLOCK_MIN_W, textW), h: BLOCK_MIN_H + portH };
+  const baseH = BLOCK_MIN_H + portH;
+  const connCount = connectionCounts.get(node.className) || 0;
+  const connH = connCount > 1 ? connCount * MIN_CONN_SLOT + 2 * CONN_MARGIN : 0;
+  return { w: Math.max(BLOCK_MIN_W, textW), h: Math.max(baseH, connH) };
 }
 
 // ─── Draw a container box (test/env — no nesting logic, just a labeled rect) ──
@@ -526,14 +594,15 @@ function drawDutBlock(parent: SVGGElement, dut: DutInfo, x: number, y: number, w
     fill: 'none', stroke: theme.stroke, 'stroke-width': 1, opacity: 0.4,
   }));
 
-  const lbl = attrs(el('text'), { x: w / 2, y: 26, 'text-anchor': 'middle', class: 'df-label' }) as SVGTextElement;
+  const textBaseY = h / 2 - 14;
+  const lbl = attrs(el('text'), { x: w / 2, y: textBaseY, 'text-anchor': 'middle', class: 'df-label' }) as SVGTextElement;
   lbl.textContent = dut.moduleName;
   g.appendChild(lbl);
-  const badge = attrs(el('text'), { x: w / 2, y: 42, 'text-anchor': 'middle', class: 'df-type', fill: theme.accent }) as SVGTextElement;
+  const badge = attrs(el('text'), { x: w / 2, y: textBaseY + 16, 'text-anchor': 'middle', class: 'df-type', fill: theme.accent }) as SVGTextElement;
   badge.textContent = '[DUT]';
   g.appendChild(badge);
   if (dut.instanceName) {
-    const inst = attrs(el('text'), { x: w / 2, y: 58, 'text-anchor': 'middle', 'font-size': 9, fill: '#999' }) as SVGTextElement;
+    const inst = attrs(el('text'), { x: w / 2, y: textBaseY + 32, 'text-anchor': 'middle', 'font-size': 9, fill: '#999' }) as SVGTextElement;
     inst.textContent = `inst: ${dut.instanceName}`;
     g.appendChild(inst);
   }
@@ -850,6 +919,38 @@ function drawRoutedArrow(parent: SVGGElement, ra: RoutedArrow): void {
     case 'top':    cp2x = x2 + tgtFan; cp2y = y2 - baseCpDist - Math.abs(tgtFan) * 0.5; break;
   }
 
+  // ── Collision avoidance: route around intermediate blocks ──
+  const possibleBlockers = drawnBlocks.filter(b => {
+    if (b.node.className === a.from.node.className || b.node.className === a.to.node.className) return false;
+    const minX = Math.min(x1, x2) - 10;
+    const maxX = Math.max(x1, x2) + 10;
+    return b.x + b.w > minX && b.x < maxX;
+  });
+
+  if (possibleBlockers.length > 0) {
+    const collidedBlocks: BlockRect[] = [];
+    for (let t = 0.02; t <= 0.98; t += 0.02) {
+      const mt = 1 - t;
+      const px = mt * mt * mt * x1 + 3 * mt * mt * t * cp1x + 3 * mt * t * t * cp2x + t * t * t * x2;
+      const py = mt * mt * mt * y1 + 3 * mt * mt * t * cp1y + 3 * mt * t * t * cp2y + t * t * t * y2;
+      for (const b of possibleBlockers) {
+        if (px > b.x - 4 && px < b.x + b.w + 4 && py > b.y - 4 && py < b.y + b.h + 4) {
+          if (!collidedBlocks.includes(b)) collidedBlocks.push(b);
+        }
+      }
+    }
+
+    if (collidedBlocks.length > 0) {
+      const minBlockY = Math.min(...collidedBlocks.map(b => b.y));
+      const maxBlockY = Math.max(...collidedBlocks.map(b => b.y + b.h));
+      const CLEARANCE = 24;
+      const goAbove = (y1 + y2) / 2 <= (minBlockY + maxBlockY) / 2;
+      const routeY = goAbove ? minBlockY - CLEARANCE : maxBlockY + CLEARANCE;
+      cp1y = routeY;
+      cp2y = routeY;
+    }
+  }
+
   const d = `M${x1},${y1} C${cp1x},${cp1y} ${cp2x},${cp2y} ${x2},${y2}`;
 
   parent.appendChild(attrs(el('path'), {
@@ -1076,11 +1177,13 @@ function drawLegendOverlay(): void {
   html += '<div class="legend-section-title">Connections</div>';
 
   for (const c of connTypes) {
-    const lineStyle = c.dashed
-      ? `background:repeating-linear-gradient(90deg,${c.color} 0px,${c.color} 5px,transparent 5px,transparent 8px);height:2px;`
-      : `background:${c.color};height:2px;`;
+    const dashAttr = c.dashed ? ' stroke-dasharray="4,2"' : '';
+    const arrowSvg = `<svg width="30" height="14" viewBox="0 0 30 14" style="vertical-align:middle;">` +
+      `<line x1="0" y1="7" x2="22" y2="7" stroke="${c.color}" stroke-width="2"${dashAttr}/>` +
+      `<path d="M19,3 L26,7 L19,11" fill="${c.color}" stroke="none"/>` +
+      `</svg>`;
     html += `<div class="legend-item">
-      <span class="legend-line" style="${lineStyle}"></span>
+      <span class="legend-conn-svg">${arrowSvg}</span>
       <span>${c.label}</span>
     </div>`;
   }
