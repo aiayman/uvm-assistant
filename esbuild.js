@@ -44,7 +44,7 @@ const extensionConfig = {
 };
 
 /** @type {import('esbuild').BuildOptions} */
-const webviewConfig = {
+const dataFlowWebviewConfig = {
   entryPoints: ['webview/diagram.ts'],
   bundle: true,
   format: 'iife',
@@ -62,10 +62,12 @@ const webviewConfig = {
           if (!fs.existsSync(distWebview)) {
             fs.mkdirSync(distWebview, { recursive: true });
           }
-          // Copy CSS
-          const cssSrc = path.join(__dirname, 'webview', 'diagram.css');
-          if (fs.existsSync(cssSrc)) {
-            fs.copyFileSync(cssSrc, path.join(distWebview, 'diagram.css'));
+          // Copy CSS files
+          for (const css of ['diagram.css', 'blockDiagram.css']) {
+            const src = path.join(__dirname, 'webview', css);
+            if (fs.existsSync(src)) {
+              fs.copyFileSync(src, path.join(distWebview, css));
+            }
           }
         });
       },
@@ -73,16 +75,30 @@ const webviewConfig = {
   ],
 };
 
+/** @type {import('esbuild').BuildOptions} */
+const blockWebviewConfig = {
+  entryPoints: ['webview/blockDiagram.ts'],
+  bundle: true,
+  format: 'iife',
+  minify: production,
+  sourcemap: !production,
+  platform: 'browser',
+  outfile: 'dist/webview/blockDiagram.js',
+  logLevel: 'info',
+};
+
 async function main() {
   if (watch) {
     const extCtx = await esbuild.context(extensionConfig);
-    const webCtx = await esbuild.context(webviewConfig);
-    await Promise.all([extCtx.watch(), webCtx.watch()]);
+    const dfCtx = await esbuild.context(dataFlowWebviewConfig);
+    const blkCtx = await esbuild.context(blockWebviewConfig);
+    await Promise.all([extCtx.watch(), dfCtx.watch(), blkCtx.watch()]);
     console.log('Watching for changes...');
   } else {
     await Promise.all([
       esbuild.build(extensionConfig),
-      esbuild.build(webviewConfig),
+      esbuild.build(dataFlowWebviewConfig),
+      esbuild.build(blockWebviewConfig),
     ]);
   }
 }

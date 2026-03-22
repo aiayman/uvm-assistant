@@ -1,4 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#c586c0" stroke-width="1.2">
-  <rect x="1" y="2" width="14" height="12" rx="2"/>
-  <text x="8" y="10" text-anchor="middle" font-size="4.5" fill="#c586c0" stroke="none" font-family="monospace">SQCR</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#c586c0" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Stacked bars with downward arrow — queue/arbiter -->
+  <rect x="3" y="1.5" width="10" height="2.5" rx="0.5"/>
+  <rect x="3" y="5.5" width="10" height="2.5" rx="0.5"/>
+  <rect x="3" y="9.5" width="10" height="2.5" rx="0.5"/>
+  <polyline points="5.5 13 8 15 10.5 13"/>
 </svg>

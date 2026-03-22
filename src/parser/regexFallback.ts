@@ -1,5 +1,5 @@
 import { ModuleNode, ModuleInstance, PortInfo } from '../models/moduleNode';
-import { UvmClassInfo, UvmField } from '../models/uvmNode';
+import { UvmClassInfo, UvmField, TlmPort, TlmConnection, TlmPortKind } from '../models/uvmNode';
 import { classifyUvmBase } from '../utils/uvmClassifier';
 
 // ─── Module declarations ────────────────────────────────────────────
@@ -88,6 +88,8 @@ export function regexParse(
     const endIdx = findEndClass(text, match.index);
     const body = text.slice(match.index, endIdx);
     const fields = extractFields(body, line);
+    const tlmPorts = extractTlmPorts(body);
+    const connections = extractConnections(body);
 
     uvmClasses.push({
       className,
@@ -96,6 +98,8 @@ export function regexParse(
       filePath,
       line,
       fields,
+      tlmPorts,
+      connections,
     });
   }
 
@@ -178,6 +182,45 @@ function extractInstances(
     instances.push({ moduleName, instanceName, filePath, line });
   }
   return instances;
+}
+
+// ─── TLM port kind mapping ───────────────────────────────────────────
+const TLM_KIND_MAP: Record<string, TlmPortKind> = {
+  'uvm_analysis_port': 'analysis_port',
+  'uvm_analysis_export': 'analysis_export',
+  'uvm_analysis_imp': 'analysis_imp',
+  'uvm_blocking_put_port': 'blocking_put_port',
+  'uvm_blocking_get_port': 'blocking_get_port',
+};
+
+function extractTlmPorts(classBody: string): TlmPort[] {
+  const ports: TlmPort[] = [];
+  const re = /(uvm_analysis_port|uvm_analysis_export|uvm_analysis_imp|uvm_blocking_put_port|uvm_blocking_get_port)\s*#\s*\(\s*([\w:]+)\s*\)\s+(\w+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(classBody)) !== null) {
+    ports.push({
+      kind: TLM_KIND_MAP[m[1]],
+      paramType: m[2],
+      fieldName: m[3],
+    });
+  }
+  return ports;
+}
+
+function extractConnections(classBody: string): TlmConnection[] {
+  const connections: TlmConnection[] = [];
+  // Match: foo.port.connect(bar.export)  or  foo.connect(bar)
+  const connectPhaseMatch = classBody.match(
+    /function\s+void\s+connect_phase\s*\(\s*uvm_phase\s+\w+\s*\)\s*;([\s\S]*?)endfunction/,
+  );
+  if (!connectPhaseMatch) { return connections; }
+  const body = connectPhaseMatch[1];
+  const re = /([\w.]+)\s*\.\s*connect\s*\(\s*([\w.]+)\s*\)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(body)) !== null) {
+    connections.push({ from: m[1], to: m[2] });
+  }
+  return connections;
 }
 
 function extractFields(classBody: string, classStartLine: number): UvmField[] {

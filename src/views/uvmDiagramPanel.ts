@@ -1,22 +1,25 @@
 import * as vscode from 'vscode';
 import * as crypto from 'crypto';
-import { UvmNode } from '../models/uvmNode';
+import { UvmNode, TlmPort, TlmConnection } from '../models/uvmNode';
+
+export type DiagramMode = 'block' | 'dataflow';
 
 export class UvmDiagramPanel {
-  private static currentPanel: UvmDiagramPanel | undefined;
+  private static panels = new Map<DiagramMode, UvmDiagramPanel>();
   private readonly panel: vscode.WebviewPanel;
   private disposables: vscode.Disposable[] = [];
   private pendingData: SerializedUvmNode[] | undefined;
-  private webviewReady = false;
+  private readonly mode: DiagramMode;
 
   private constructor(
     panel: vscode.WebviewPanel,
     private extensionUri: vscode.Uri,
+    mode: DiagramMode,
   ) {
     this.panel = panel;
+    this.mode = mode;
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
 
-    // Handle messages from webview
     this.panel.webview.onDidReceiveMessage(
       (msg) => {
         if (msg.command === 'ready') {
@@ -34,18 +37,22 @@ export class UvmDiagramPanel {
     );
   }
 
-  static createOrShow(extensionUri: vscode.Uri, uvmRoots: UvmNode[]): void {
+  static createOrShow(extensionUri: vscode.Uri, uvmRoots: UvmNode[], mode: DiagramMode = 'block'): void {
     const column = vscode.window.activeTextEditor?.viewColumn ?? vscode.ViewColumn.One;
+    const existing = UvmDiagramPanel.panels.get(mode);
 
-    if (UvmDiagramPanel.currentPanel) {
-      UvmDiagramPanel.currentPanel.panel.reveal(column);
-      UvmDiagramPanel.currentPanel.updateDiagram(uvmRoots);
+    if (existing) {
+      existing.panel.reveal(column);
+      existing.updateDiagram(uvmRoots);
       return;
     }
 
+    const title = mode === 'block' ? 'UVM Block Diagram' : 'UVM Data Flow Diagram';
+    const viewType = mode === 'block' ? 'uvmBlockDiagram' : 'uvmDataFlowDiagram';
+
     const panel = vscode.window.createWebviewPanel(
-      'uvmAssistantDiagram',
-      'UVM Block Diagram',
+      viewType,
+      title,
       column,
       {
         enableScripts: true,
@@ -57,19 +64,17 @@ export class UvmDiagramPanel {
       },
     );
 
-    UvmDiagramPanel.currentPanel = new UvmDiagramPanel(panel, extensionUri);
-    UvmDiagramPanel.currentPanel.updateDiagram(uvmRoots);
+    const instance = new UvmDiagramPanel(panel, extensionUri, mode);
+    UvmDiagramPanel.panels.set(mode, instance);
+    instance.updateDiagram(uvmRoots);
   }
 
   updateDiagram(uvmRoots: UvmNode[]): void {
     this.pendingData = serializeUvmTree(uvmRoots);
-    this.webviewReady = false;
-    this.panel.webview.html = this.getHtml(this.panel.webview);
-    // Data is sent when the webview posts its 'ready' message
+        this.panel.webview.html = this.getHtml(this.panel.webview);
   }
 
   private flushPendingData(): void {
-    this.webviewReady = true;
     if (this.pendingData) {
       this.panel.webview.postMessage({
         command: 'renderDiagram',
@@ -81,11 +86,16 @@ export class UvmDiagramPanel {
 
   private getHtml(webview: vscode.Webview): string {
     const nonce = crypto.randomBytes(16).toString('hex');
+
+    const scriptFile = this.mode === 'block' ? 'blockDiagram.js' : 'diagram.js';
+    const cssFile = this.mode === 'block' ? 'blockDiagram.css' : 'diagram.css';
+    const title = this.mode === 'block' ? 'UVM Block Diagram' : 'UVM Data Flow Diagram';
+
     const scriptUri = webview.asWebviewUri(
-      vscode.Uri.joinPath(this.extensionUri, 'dist', 'webview', 'diagram.js'),
+      vscode.Uri.joinPath(this.extensionUri, 'dist', 'webview', scriptFile),
     );
     const cssUri = webview.asWebviewUri(
-      vscode.Uri.joinPath(this.extensionUri, 'dist', 'webview', 'diagram.css'),
+      vscode.Uri.joinPath(this.extensionUri, 'dist', 'webview', cssFile),
     );
 
     return /* html */ `<!DOCTYPE html>
@@ -99,13 +109,13 @@ export class UvmDiagramPanel {
       script-src 'nonce-${nonce}';
       img-src ${webview.cspSource} data:;">
   <link rel="stylesheet" href="${cssUri}">
-  <title>UVM Block Diagram</title>
+  <title>${title}</title>
 </head>
 <body>
   <div id="toolbar">
     <button id="btn-zoom-in" title="Zoom In">+</button>
-    <button id="btn-zoom-out" title="Zoom Out">−</button>
-    <button id="btn-reset" title="Reset View">⊙</button>
+    <button id="btn-zoom-out" title="Zoom Out">&minus;</button>
+    <button id="btn-reset" title="Reset View">&odot;</button>
   </div>
   <div id="diagram-container">
     <svg id="diagram"></svg>
@@ -120,7 +130,7 @@ export class UvmDiagramPanel {
   }
 
   private dispose(): void {
-    UvmDiagramPanel.currentPanel = undefined;
+    UvmDiagramPanel.panels.delete(this.mode);
     this.panel.dispose();
     this.disposables.forEach((d) => d.dispose());
     this.disposables = [];
@@ -134,12 +144,14 @@ interface SerializedUvmNode {
   filePath: string;
   line: number;
   children: SerializedUvmNode[];
+  tlmPorts: TlmPort[];
+  connections: TlmConnection[];
 }
 
 function serializeUvmTree(roots: UvmNode[]): SerializedUvmNode[] {
   const visited = new Set<string>();
   function serialize(node: UvmNode): SerializedUvmNode | null {
-    if (visited.has(node.className)) { return null; } // prevent cycles
+    if (visited.has(node.className)) { return null; }
     visited.add(node.className);
     return {
       className: node.className,
@@ -148,6 +160,8 @@ function serializeUvmTree(roots: UvmNode[]): SerializedUvmNode[] {
       filePath: node.filePath,
       line: node.line,
       children: node.children.map(serialize).filter((n): n is SerializedUvmNode => n !== null),
+      tlmPorts: node.tlmPorts,
+      connections: node.connections,
     };
   }
   return roots.map(serialize).filter((n): n is SerializedUvmNode => n !== null);

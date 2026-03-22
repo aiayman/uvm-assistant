@@ -1,4 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#6a9955" stroke-width="1.2">
-  <rect x="1" y="2" width="14" height="12" rx="2"/>
-  <text x="8" y="10" text-anchor="middle" font-size="5" fill="#6a9955" stroke="none" font-family="monospace">AGT</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#6a9955" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Folder with gear tab — agent bundles sub-components -->
+  <path d="M2 4.5h4l1.5-2h5.5a1 1 0 011 1v8a1 1 0 01-1 1H2a1 1 0 01-1-1v-6a1 1 0 011-1z"/>
+  <circle cx="8" cy="8.5" r="2" stroke-width="1"/>
+  <line x1="8" y1="6" x2="8" y2="6.5"/>
+  <line x1="8" y1="10.5" x2="8" y2="11"/>
+  <line x1="5.5" y1="8.5" x2="6" y2="8.5"/>
+  <line x1="10" y1="8.5" x2="10.5" y2="8.5"/>
 </svg>

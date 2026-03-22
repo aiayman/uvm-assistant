@@ -1,4 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#4ec9b0" stroke-width="1.2">
-  <rect x="1" y="2" width="14" height="12" rx="2"/>
-  <text x="8" y="10" text-anchor="middle" font-size="4.5" fill="#4ec9b0" stroke="none" font-family="monospace">TEST</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#4ec9b0" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Flask/beaker with checkmark — test execution -->
+  <path d="M6 1.5h4"/>
+  <path d="M7 1.5v4L4.5 11a2 2 0 001.7 3h3.6a2 2 0 001.7-3L9 5.5v-4"/>
+  <path d="M5 9h6"/>
+  <polyline points="6.5 11.5 7.5 12.5 9.5 10.5"/>
 </svg>

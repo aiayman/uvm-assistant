@@ -37,7 +37,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand('uvm-assistant.refresh', () => runAnalysis(extensionUri)),
     vscode.commands.registerCommand('uvm-assistant.openBlockDiagram', () => {
       if (lastResult) {
-        UvmDiagramPanel.createOrShow(extensionUri, lastResult.uvmRoots);
+        UvmDiagramPanel.createOrShow(extensionUri, lastResult.uvmRoots, 'block');
+      } else {
+        vscode.window.showInformationMessage('UVM-Assistant: Run analysis first (click Refresh).');
+      }
+    }),
+    vscode.commands.registerCommand('uvm-assistant.openDataFlowDiagram', () => {
+      if (lastResult) {
+        UvmDiagramPanel.createOrShow(extensionUri, lastResult.uvmRoots, 'dataflow');
       } else {
         vscode.window.showInformationMessage('UVM-Assistant: Run analysis first (click Refresh).');
       }

@@ -103,6 +103,8 @@ export class SvParser {
             filePath,
             line: node.startPosition.row + 1,
             fields: [],
+            tlmPorts: [],
+            connections: [],
           });
         }
       }
@@ -125,9 +127,11 @@ export class SvParser {
       if (!existing) {
         uvmClasses.push(cls);
         uvmByName.set(cls.className, cls);
-      } else if (existing.fields.length === 0) {
-        // Merge fields from regex into tree-sitter result
-        existing.fields = cls.fields;
+      } else {
+        // Merge fields, ports, connections from regex into tree-sitter result
+        if (existing.fields.length === 0) { existing.fields = cls.fields; }
+        if (existing.tlmPorts.length === 0) { existing.tlmPorts = cls.tlmPorts; }
+        if (existing.connections.length === 0) { existing.connections = cls.connections; }
       }
     }
 
@@ -211,6 +215,8 @@ function buildUvmHierarchy(allClasses: Map<string, UvmClassInfo>): UvmNode[] {
       line: cls.line,
       fields: cls.fields,
       children: [],
+      tlmPorts: cls.tlmPorts,
+      connections: cls.connections,
     });
   }
 

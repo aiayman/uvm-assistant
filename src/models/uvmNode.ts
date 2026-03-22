@@ -11,6 +11,28 @@ export type UvmType =
   | 'object'
   | 'unknown';
 
+export type TlmPortKind =
+  | 'analysis_port'
+  | 'analysis_export'
+  | 'analysis_imp'
+  | 'blocking_put_port'
+  | 'blocking_get_port'
+  | 'seq_item_port'
+  | 'seq_item_export';
+
+export interface TlmPort {
+  kind: TlmPortKind;
+  paramType: string;
+  fieldName: string;
+}
+
+export interface TlmConnection {
+  /** e.g. "drv.seq_item_port" */
+  from: string;
+  /** e.g. "seqr.seq_item_export" */
+  to: string;
+}
+
 export interface UvmNode {
   className: string;
   baseClass: string;
@@ -19,6 +41,8 @@ export interface UvmNode {
   line: number;
   fields: UvmField[];
   children: UvmNode[];
+  tlmPorts: TlmPort[];
+  connections: TlmConnection[];
 }
 
 export interface UvmField {
@@ -35,4 +59,6 @@ export interface UvmClassInfo {
   filePath: string;
   line: number;
   fields: UvmField[];
+  tlmPorts: TlmPort[];
+  connections: TlmConnection[];
 }

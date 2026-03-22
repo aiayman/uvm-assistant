@@ -1,4 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#b5cea8" stroke-width="1.2">
-  <rect x="1" y="2" width="14" height="12" rx="2"/>
-  <text x="8" y="10" text-anchor="middle" font-size="5" fill="#b5cea8" stroke="none" font-family="monospace">SEQ</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="#b5cea8" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Numbered list — ordered transaction sequence -->
+  <circle cx="3" cy="3.5" r="1" fill="#b5cea8" stroke="none"/>
+  <line x1="5.5" y1="3.5" x2="14" y2="3.5"/>
+  <circle cx="3" cy="8" r="1" fill="#b5cea8" stroke="none"/>
+  <line x1="5.5" y1="8" x2="14" y2="8"/>
+  <circle cx="3" cy="12.5" r="1" fill="#b5cea8" stroke="none"/>
+  <line x1="5.5" y1="12.5" x2="14" y2="12.5"/>
 </svg>

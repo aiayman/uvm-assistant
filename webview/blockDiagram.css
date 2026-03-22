@@ -1,4 +1,4 @@
-/* UVM Data Flow Diagram styles */
+/* UVM Block Diagram — simple nested rectangles */
 
 :root {
   --bg: var(--vscode-editor-background, #1e1e1e);
@@ -59,69 +59,25 @@ body {
   gap: 8px;
 }
 
-/* ─── Block styles ─────────────────────────────────────────── */
+.block { cursor: pointer; }
 
-.df-block {
-  cursor: pointer;
-  transition: filter 0.15s ease;
-}
-
-.df-block text {
+.block text {
   fill: var(--fg);
   font-size: 12px;
   pointer-events: none;
 }
 
-.df-block .df-label {
+.block .block-label {
   font-weight: bold;
   font-size: 13px;
 }
 
-.df-block .df-type {
+.block .block-type {
   font-size: 10px;
   opacity: 0.6;
 }
 
-.df-block .df-port-label {
-  font-size: 7px;
-  pointer-events: none;
-}
-
-.df-block .df-icon {
-  pointer-events: none;
-  opacity: 0.7;
-}
-
-.df-block:hover > rect {
-  filter: brightness(1.4);
+.block:hover > rect {
+  filter: brightness(1.3);
   stroke-width: 3;
-}
-
-.df-block:hover .df-icon {
-  opacity: 1;
-}
-
-/* ─── Connection arrows ────────────────────────────────────── */
-
-.df-arrow {
-  stroke: #8888cc;
-  stroke-width: 2;
-  fill: none;
-  opacity: 0.7;
-  stroke-linecap: round;
-}
-
-.df-connections {
-  pointer-events: none;
-}
-
-/* ─── Legend ────────────────────────────────────────────────── */
-
-.df-legend {
-  opacity: 0.85;
-  pointer-events: none;
-}
-
-.df-legend text {
-  pointer-events: none;
 }
