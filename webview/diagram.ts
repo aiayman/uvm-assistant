@@ -57,9 +57,10 @@ const PORT_AREA_H = 20;
 const CHAR_W = 7.5;
 const DUT_W = 140;
 const DUT_H = 80;
-const TRACK_SPACING = 8;
-const BLOCK_ARROW_GAP = 12;
+const TRACK_SPACING = 12;
+const BLOCK_ARROW_GAP = 14;
 const CORNER_R = 3;
+const PORT_CIRCLE_R = 3.5;
 
 // Pipeline stage order (lower = further left)
 const STAGE: Record<string, number> = {
@@ -852,185 +853,242 @@ function routeAndDrawArrows(parent: SVGGElement, arrows: Arrow[]): void {
     }
   }
 
-  // Step 3: Compute orthogonal paths
+  // Step 3: Compute collision-aware orthogonal paths
   for (const ra of routed) computeOrthoPath(ra);
 
-  // Step 4: Collision avoidance — move vertical segments out of blocks
-  for (const ra of routed) avoidBlockCollisions(ra);
-
-  // Step 5: Deconflict parallel vertical and horizontal tracks
+  // Step 4: Deconflict parallel vertical and horizontal tracks
   deconflictTracks(routed);
 
   // Step 6: Draw
   for (const ra of routed) drawOrthoArrow(parent, ra);
 }
 
-// ─── Orthogonal path computation ──────────────────────────────
+// ─── Segment collision helpers ─────────────────────────────────
+
+type Pt = { x: number; y: number };
+
+function hSegHitsBlock(x1: number, x2: number, y: number, obs: BlockRect[]): boolean {
+  const xMin = Math.min(x1, x2), xMax = Math.max(x1, x2);
+  return obs.some(b =>
+    b.x + b.w > xMin + 2 && b.x < xMax - 2 &&
+    y > b.y - BLOCK_ARROW_GAP && y < b.y + b.h + BLOCK_ARROW_GAP
+  );
+}
+
+function vSegHitsBlock(x: number, y1: number, y2: number, obs: BlockRect[]): boolean {
+  const yMin = Math.min(y1, y2), yMax = Math.max(y1, y2);
+  return obs.some(b =>
+    x > b.x - BLOCK_ARROW_GAP && x < b.x + b.w + BLOCK_ARROW_GAP &&
+    yMax > b.y + 2 && yMin < b.y + b.h - 2
+  );
+}
+
+function findClearVChannel(xL: number, xR: number, y1: number, y2: number, obs: BlockRect[]): number {
+  const midX = Math.round((xL + xR) / 2);
+  if (!vSegHitsBlock(midX, y1, y2, obs)) return midX;
+
+  // Find gaps between obstacle blocks in the X range
+  const yMin = Math.min(y1, y2), yMax = Math.max(y1, y2);
+  const inRange = obs.filter(b =>
+    b.x + b.w > Math.min(xL, xR) && b.x < Math.max(xL, xR) &&
+    yMax > b.y - 4 && yMin < b.y + b.h + 4
+  ).sort((a, b) => a.x - b.x);
+
+  const gaps: number[] = [];
+  if (inRange.length > 0 && inRange[0].x > Math.min(xL, xR) + BLOCK_ARROW_GAP * 2) {
+    gaps.push(Math.round((Math.min(xL, xR) + inRange[0].x) / 2));
+  }
+  for (let i = 0; i < inRange.length - 1; i++) {
+    const right = inRange[i].x + inRange[i].w;
+    const left = inRange[i + 1].x;
+    if (left - right > BLOCK_ARROW_GAP * 2) gaps.push(Math.round((right + left) / 2));
+  }
+  if (inRange.length > 0) {
+    const last = inRange[inRange.length - 1];
+    if (Math.max(xL, xR) - (last.x + last.w) > BLOCK_ARROW_GAP * 2) {
+      gaps.push(Math.round((last.x + last.w + Math.max(xL, xR)) / 2));
+    }
+  }
+
+  gaps.sort((a, b) => Math.abs(a - midX) - Math.abs(b - midX));
+  for (const g of gaps) { if (!vSegHitsBlock(g, y1, y2, obs)) return g; }
+
+  for (let off = TRACK_SPACING; off < 400; off += TRACK_SPACING) {
+    if (!vSegHitsBlock(midX + off, y1, y2, obs)) return midX + off;
+    if (!vSegHitsBlock(midX - off, y1, y2, obs)) return midX - off;
+  }
+  return midX;
+}
+
+// ─── Collision-aware orthogonal path computation ──────────────
 
 function computeOrthoPath(ra: RoutedArrow): void {
-  const { srcX: x1, srcY: y1, tgtX: x2, tgtY: y2, srcSide, tgtSide } = ra;
-  const pts: { x: number; y: number }[] = [{ x: x1, y: y1 }];
+  const { srcX: x1, srcY: y1, tgtX: x2, tgtY: y2, srcSide, tgtSide, arrow } = ra;
+
+  const obs = drawnBlocks.filter(b =>
+    b.node.className !== arrow.from.node.className &&
+    b.node.className !== arrow.to.node.className
+  );
 
   if (srcSide === 'right' && tgtSide === 'left') {
-    if (Math.abs(y1 - y2) < 2) {
-      // Straight horizontal
-    } else {
-      const midX = Math.round((x1 + x2) / 2);
-      pts.push({ x: midX, y: y1 });
-      pts.push({ x: midX, y: y2 });
-    }
+    ra.waypoints = routeHorizontal(x1, y1, x2, y2, obs);
   } else if (srcSide === 'left' && tgtSide === 'right') {
-    // Backwards arrow: route above all blocks
-    const minY = drawnBlocks.length > 0
-      ? Math.min(...drawnBlocks.map(b => b.y), y1, y2) : Math.min(y1, y2);
-    const routeY = Math.round(minY - 30);
-    const exitX = Math.round(x1 - 15);
-    const entryX = Math.round(x2 + 15);
-    pts.push({ x: exitX, y: y1 });
-    pts.push({ x: exitX, y: routeY });
-    pts.push({ x: entryX, y: routeY });
-    pts.push({ x: entryX, y: y2 });
+    ra.waypoints = routeBackwards(x1, y1, x2, y2);
   } else if ((srcSide === 'bottom' && tgtSide === 'top') ||
              (srcSide === 'top' && tgtSide === 'bottom')) {
-    if (Math.abs(x1 - x2) < 2) {
-      // Straight vertical
-    } else {
-      const midY = Math.round((y1 + y2) / 2);
-      pts.push({ x: x1, y: midY });
-      pts.push({ x: x2, y: midY });
-    }
+    ra.waypoints = routeVertical(x1, y1, x2, y2);
   } else {
-    // Mixed sides: L-shape
+    const pts: Pt[] = [{ x: x1, y: y1 }];
     if (srcSide === 'right' || srcSide === 'left') {
       pts.push({ x: x2, y: y1 });
     } else {
       pts.push({ x: x1, y: y2 });
     }
+    pts.push({ x: x2, y: y2 });
+    ra.waypoints = pts;
   }
-
-  pts.push({ x: x2, y: y2 });
-  ra.waypoints = pts;
 }
 
-// ─── Collision avoidance for vertical segments ────────────────
-
-function avoidBlockCollisions(ra: RoutedArrow): void {
-  const pts = ra.waypoints;
-  // Only Z-shape (4 points) has a vertical segment that might hit intermediate blocks
-  if (pts.length !== 4) return;
-
-  const vx = pts[1].x;
-  const yMin = Math.min(pts[1].y, pts[2].y);
-  const yMax = Math.max(pts[1].y, pts[2].y);
-
-  const isBlocked = (x: number) => drawnBlocks.some(b =>
-    b.node.className !== ra.arrow.from.node.className &&
-    b.node.className !== ra.arrow.to.node.className &&
-    x > b.x - BLOCK_ARROW_GAP && x < b.x + b.w + BLOCK_ARROW_GAP &&
-    yMax > b.y - 4 && yMin < b.y + b.h + 4
-  );
-
-  if (!isBlocked(vx)) return;
-
-  // Search outward for a clear channel, preferring the side closer to the gap
-  for (let offset = TRACK_SPACING; offset < 400; offset += TRACK_SPACING) {
-    if (!isBlocked(vx + offset)) {
-      pts[1].x = vx + offset; pts[2].x = vx + offset; return;
+function routeHorizontal(x1: number, y1: number, x2: number, y2: number, obs: BlockRect[]): Pt[] {
+  // Same Y: try straight line first
+  if (Math.abs(y1 - y2) < 2) {
+    if (!hSegHitsBlock(x1, x2, y1, obs)) {
+      return [{ x: x1, y: y1 }, { x: x2, y: y2 }];
     }
-    if (!isBlocked(vx - offset)) {
-      pts[1].x = vx - offset; pts[2].x = vx - offset; return;
-    }
+    return routeDetour(x1, y1, x2, y2, obs);
   }
+
+  // Different Y: Z-shape with a clear vertical channel
+  const midX = findClearVChannel(x1, x2, y1, y2, obs);
+  if (!hSegHitsBlock(x1, midX, y1, obs) && !hSegHitsBlock(midX, x2, y2, obs)) {
+    return [
+      { x: x1, y: y1 }, { x: midX, y: y1 },
+      { x: midX, y: y2 }, { x: x2, y: y2 },
+    ];
+  }
+  return routeDetour(x1, y1, x2, y2, obs);
+}
+
+function routeDetour(x1: number, y1: number, x2: number, y2: number, obs: BlockRect[]): Pt[] {
+  const xMin = Math.min(x1, x2), xMax = Math.max(x1, x2);
+  const blockers = obs.filter(b => b.x + b.w > xMin && b.x < xMax);
+  if (blockers.length === 0) {
+    const midX = Math.round((x1 + x2) / 2);
+    if (Math.abs(y1 - y2) < 2) return [{ x: x1, y: y1 }, { x: x2, y: y2 }];
+    return [{ x: x1, y: y1 }, { x: midX, y: y1 }, { x: midX, y: y2 }, { x: x2, y: y2 }];
+  }
+
+  const minBY = Math.min(...blockers.map(b => b.y));
+  const maxBY = Math.max(...blockers.map(b => b.y + b.h));
+  const above = minBY - 30, below = maxBY + 30;
+  const detourY = (Math.abs(y1 - above) + Math.abs(y2 - above) <
+                   Math.abs(y1 - below) + Math.abs(y2 - below)) ? above : below;
+
+  const vx1N = x1 + 12;
+  const vx2N = x2 - 12;
+  const vx1 = vSegHitsBlock(vx1N, y1, detourY, obs)
+    ? findClearVChannel(x1, (x1 + x2) / 2, y1, detourY, obs) : vx1N;
+  const vx2 = vSegHitsBlock(vx2N, y2, detourY, obs)
+    ? findClearVChannel((x1 + x2) / 2, x2, y2, detourY, obs) : vx2N;
+
+  return [
+    { x: x1, y: y1 }, { x: vx1, y: y1 },
+    { x: vx1, y: detourY }, { x: vx2, y: detourY },
+    { x: vx2, y: y2 }, { x: x2, y: y2 },
+  ];
+}
+
+function routeBackwards(x1: number, y1: number, x2: number, y2: number): Pt[] {
+  const allMinY = drawnBlocks.length > 0
+    ? Math.min(...drawnBlocks.map(b => b.y), y1, y2) : Math.min(y1, y2);
+  const routeY = Math.round(allMinY - 30);
+  const exitX = Math.round(x1 - 15);
+  const entryX = Math.round(x2 + 15);
+  return [
+    { x: x1, y: y1 }, { x: exitX, y: y1 },
+    { x: exitX, y: routeY }, { x: entryX, y: routeY },
+    { x: entryX, y: y2 }, { x: x2, y: y2 },
+  ];
+}
+
+function routeVertical(x1: number, y1: number, x2: number, y2: number): Pt[] {
+  if (Math.abs(x1 - x2) < 2) return [{ x: x1, y: y1 }, { x: x2, y: y2 }];
+  const midY = Math.round((y1 + y2) / 2);
+  return [{ x: x1, y: y1 }, { x: x1, y: midY }, { x: x2, y: midY }, { x: x2, y: y2 }];
 }
 
 // ─── Track deconfliction ──────────────────────────────────────
 
+interface SegInfo { routeIdx: number; segIdx: number; pos: number; min: number; max: number }
+
 function deconflictTracks(routed: RoutedArrow[]): void {
-  // ── Vertical segments ──
-  interface VSeg { routeIdx: number; x: number; yMin: number; yMax: number }
-  const vSegs: VSeg[] = [];
-  for (let i = 0; i < routed.length; i++) {
-    const pts = routed[i].waypoints;
-    if (pts.length === 4) {
-      vSegs.push({
-        routeIdx: i, x: pts[1].x,
-        yMin: Math.min(pts[1].y, pts[2].y),
-        yMax: Math.max(pts[1].y, pts[2].y),
-      });
-    }
-  }
-
-  if (vSegs.length > 1) {
-    vSegs.sort((a, b) => a.x - b.x);
-    let i = 0;
-    while (i < vSegs.length) {
-      let j = i + 1;
-      while (j < vSegs.length && vSegs[j].x - vSegs[i].x < TRACK_SPACING * 2) j++;
-      const group = vSegs.slice(i, j);
-      if (group.length > 1 && group.some((a, ai) =>
-        group.some((b, bi) => ai !== bi && a.yMax > b.yMin && a.yMin < b.yMax))) {
-        const centerX = group.reduce((s, v) => s + v.x, 0) / group.length;
-        group.sort((a, b) => (a.yMin + a.yMax) / 2 - (b.yMin + b.yMax) / 2);
-        const totalW = (group.length - 1) * TRACK_SPACING;
-        for (let k = 0; k < group.length; k++) {
-          const newX = Math.round(centerX - totalW / 2 + k * TRACK_SPACING);
-          const pts = routed[group[k].routeIdx].waypoints;
-          pts[1].x = newX; pts[2].x = newX;
-        }
-      }
-      i = j;
-    }
-  }
-
-  // ── Horizontal segments ──
-  interface HSeg { routeIdx: number; segIdx: number; y: number; xMin: number; xMax: number }
-  const hSegs: HSeg[] = [];
+  // Collect ALL vertical segments across all paths
+  const vSegs: SegInfo[] = [];
+  const hSegs: SegInfo[] = [];
   for (let ri = 0; ri < routed.length; ri++) {
     const pts = routed[ri].waypoints;
     for (let si = 0; si < pts.length - 1; si++) {
-      if (Math.abs(pts[si].y - pts[si + 1].y) < 1 && Math.abs(pts[si].x - pts[si + 1].x) > 4) {
-        hSegs.push({
-          routeIdx: ri, segIdx: si, y: pts[si].y,
-          xMin: Math.min(pts[si].x, pts[si + 1].x),
-          xMax: Math.max(pts[si].x, pts[si + 1].x),
-        });
+      const dx = Math.abs(pts[si].x - pts[si + 1].x);
+      const dy = Math.abs(pts[si].y - pts[si + 1].y);
+      if (dx < 1 && dy > 4) {
+        vSegs.push({ routeIdx: ri, segIdx: si, pos: pts[si].x,
+          min: Math.min(pts[si].y, pts[si + 1].y), max: Math.max(pts[si].y, pts[si + 1].y) });
+      } else if (dy < 1 && dx > 4) {
+        hSegs.push({ routeIdx: ri, segIdx: si, pos: pts[si].y,
+          min: Math.min(pts[si].x, pts[si + 1].x), max: Math.max(pts[si].x, pts[si + 1].x) });
       }
     }
   }
 
-  if (hSegs.length > 1) {
-    hSegs.sort((a, b) => a.y - b.y);
-    let i = 0;
-    while (i < hSegs.length) {
-      let j = i + 1;
-      while (j < hSegs.length && Math.abs(hSegs[j].y - hSegs[i].y) < TRACK_SPACING) j++;
-      const group = hSegs.slice(i, j);
-      if (group.length > 1 && group.some((a, ai) =>
-        group.some((b, bi) => ai !== bi && a.xMax > b.xMin && a.xMin < b.xMax))) {
-        const centerY = group.reduce((s, h) => s + h.y, 0) / group.length;
-        group.sort((a, b) => (a.xMin + a.xMax) / 2 - (b.xMin + b.xMax) / 2);
-        const totalH = (group.length - 1) * TRACK_SPACING;
-        for (let k = 0; k < group.length; k++) {
-          const newY = Math.round(centerY - totalH / 2 + k * TRACK_SPACING);
-          const pts = routed[group[k].routeIdx].waypoints;
-          const si = group[k].segIdx;
-          pts[si].y = newY; pts[si + 1].y = newY;
-        }
+  spreadOverlapping(vSegs, routed, 'v');
+  spreadOverlapping(hSegs, routed, 'h');
+}
+
+function spreadOverlapping(segs: SegInfo[], routed: RoutedArrow[], axis: 'v' | 'h'): void {
+  if (segs.length <= 1) return;
+  segs.sort((a, b) => a.pos - b.pos);
+  let i = 0;
+  while (i < segs.length) {
+    let j = i + 1;
+    while (j < segs.length && segs[j].pos - segs[i].pos < TRACK_SPACING * 1.5) j++;
+    const group = segs.slice(i, j);
+    if (group.length > 1 && group.some((a, ai) =>
+      group.some((b, bi) => ai !== bi && a.max > b.min && a.min < b.max))) {
+      const center = group.reduce((s, seg) => s + seg.pos, 0) / group.length;
+      group.sort((a, b) => (a.min + a.max) / 2 - (b.min + b.max) / 2);
+      const span = (group.length - 1) * TRACK_SPACING;
+      for (let k = 0; k < group.length; k++) {
+        const newPos = Math.round(center - span / 2 + k * TRACK_SPACING);
+        const pts = routed[group[k].routeIdx].waypoints;
+        const si = group[k].segIdx;
+        if (axis === 'v') { pts[si].x = newPos; pts[si + 1].x = newPos; }
+        else              { pts[si].y = newPos; pts[si + 1].y = newPos; }
       }
-      i = j;
     }
+    i = j;
   }
 }
 
-// ─── Orthogonal arrow drawing ─────────────────────────────────
+// ─── Orthogonal arrow drawing with port shapes ────────────────
 
 function drawOrthoArrow(parent: SVGGElement, ra: RoutedArrow): void {
   const { arrow: a, waypoints: pts } = ra;
   if (pts.length < 2) return;
 
+  // Port circle at source (connection point on block border)
+  parent.appendChild(attrs(el('circle'), {
+    cx: pts[0].x, cy: pts[0].y, r: PORT_CIRCLE_R,
+    fill: a.color, stroke: '#1e1e1e', 'stroke-width': 1, class: 'df-port-dot',
+  }));
+
+  // Port circle at target
+  parent.appendChild(attrs(el('circle'), {
+    cx: pts[pts.length - 1].x, cy: pts[pts.length - 1].y, r: PORT_CIRCLE_R,
+    fill: a.color, stroke: '#1e1e1e', 'stroke-width': 1, class: 'df-port-dot',
+  }));
+
   // Build SVG path with tiny rounded corners at elbows
   let d = `M${pts[0].x},${pts[0].y}`;
-
   for (let i = 1; i < pts.length - 1; i++) {
     const prev = pts[i - 1], curr = pts[i], next = pts[i + 1];
     const dx1 = curr.x - prev.x, dy1 = curr.y - prev.y;
@@ -1038,23 +1096,18 @@ function drawOrthoArrow(parent: SVGGElement, ra: RoutedArrow): void {
     const len1 = Math.sqrt(dx1 * dx1 + dy1 * dy1);
     const len2 = Math.sqrt(dx2 * dx2 + dy2 * dy2);
     const r = Math.min(CORNER_R, len1 / 2, len2 / 2);
-
     if (r > 0.5 && len1 > 0 && len2 > 0) {
-      const bx = curr.x - (dx1 / len1) * r;
-      const by = curr.y - (dy1 / len1) * r;
-      const ax = curr.x + (dx2 / len2) * r;
-      const ay = curr.y + (dy2 / len2) * r;
+      const bx = curr.x - (dx1 / len1) * r, by = curr.y - (dy1 / len1) * r;
+      const ax = curr.x + (dx2 / len2) * r, ay = curr.y + (dy2 / len2) * r;
       d += ` L${bx},${by} Q${curr.x},${curr.y} ${ax},${ay}`;
     } else {
       d += ` L${curr.x},${curr.y}`;
     }
   }
-
   d += ` L${pts[pts.length - 1].x},${pts[pts.length - 1].y}`;
 
   parent.appendChild(attrs(el('path'), {
-    d,
-    class: 'df-arrow',
+    d, class: 'df-arrow',
     stroke: a.color, 'stroke-width': 1.8, fill: 'none',
     'stroke-dasharray': a.dashed ? '6,3' : 'none',
     'marker-end': `url(#${a.marker})`,
@@ -1062,45 +1115,32 @@ function drawOrthoArrow(parent: SVGGElement, ra: RoutedArrow): void {
 
   // Label on longest segment
   if (a.label) {
-    let bestLen = 0, bestMx = 0, bestMy = 0, isVertical = false;
+    let bestLen = 0, bestMx = 0, bestMy = 0, isVert = false;
     for (let i = 0; i < pts.length - 1; i++) {
-      const dx = pts[i + 1].x - pts[i].x;
-      const dy = pts[i + 1].y - pts[i].y;
+      const dx = pts[i + 1].x - pts[i].x, dy = pts[i + 1].y - pts[i].y;
       const len = Math.sqrt(dx * dx + dy * dy);
       if (len > bestLen) {
         bestLen = len;
         bestMx = (pts[i].x + pts[i + 1].x) / 2;
         bestMy = (pts[i].y + pts[i + 1].y) / 2;
-        isVertical = Math.abs(dy) > Math.abs(dx);
+        isVert = Math.abs(dy) > Math.abs(dx);
       }
     }
-
     const displayLabel = a.label.length > 20 ? a.label.slice(0, 18) + '..' : a.label;
     const tw = displayLabel.length * 5 + 10;
+    const lx = isVert ? bestMx + 6 : bestMx;
+    const ly = isVert ? bestMy : bestMy - 12;
 
-    if (!isVertical) {
-      parent.appendChild(attrs(el('rect'), {
-        x: bestMx - tw / 2, y: bestMy - 15, width: tw, height: 14,
-        rx: 3, fill: '#111', opacity: 0.92, stroke: a.color, 'stroke-width': 0.5,
-      }));
-      const lbl = attrs(el('text'), {
-        x: bestMx, y: bestMy - 5, 'text-anchor': 'middle',
-        'font-size': 8, fill: a.color, class: 'df-arrow-label',
-      }) as SVGTextElement;
-      lbl.textContent = displayLabel;
-      parent.appendChild(lbl);
-    } else {
-      parent.appendChild(attrs(el('rect'), {
-        x: bestMx + 4, y: bestMy - 7, width: tw, height: 14,
-        rx: 3, fill: '#111', opacity: 0.92, stroke: a.color, 'stroke-width': 0.5,
-      }));
-      const lbl = attrs(el('text'), {
-        x: bestMx + 4 + tw / 2, y: bestMy + 3, 'text-anchor': 'middle',
-        'font-size': 8, fill: a.color, class: 'df-arrow-label',
-      }) as SVGTextElement;
-      lbl.textContent = displayLabel;
-      parent.appendChild(lbl);
-    }
+    parent.appendChild(attrs(el('rect'), {
+      x: lx - tw / 2, y: ly - 7, width: tw, height: 14,
+      rx: 3, fill: '#111', opacity: 0.92, stroke: a.color, 'stroke-width': 0.5,
+    }));
+    const lbl = attrs(el('text'), {
+      x: lx, y: ly + 3, 'text-anchor': 'middle',
+      'font-size': 8, fill: a.color, class: 'df-arrow-label',
+    }) as SVGTextElement;
+    lbl.textContent = displayLabel;
+    parent.appendChild(lbl);
   }
 }
 

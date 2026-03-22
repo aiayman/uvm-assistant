@@ -2,7 +2,7 @@
   "name": "uvm-assistant",
   "displayName": "UVM-Assistant",
   "description": "Analyzes Verilog/SystemVerilog workspaces to visualize module hierarchy, UVM class hierarchy, and UVM block diagrams.",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "publisher": "uvm-assistant",
   "license": "MIT",
   "engines": {

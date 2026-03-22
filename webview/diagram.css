@@ -139,6 +139,10 @@ body {
   pointer-events: none;
 }
 
+.df-port-dot {
+  pointer-events: none;
+}
+
 .df-arrow-label {
   font-family: var(--vscode-font-family, 'Segoe UI', Tahoma, sans-serif);
   pointer-events: none;
