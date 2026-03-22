@@ -128,6 +128,15 @@ body {
   fill: none;
   opacity: 0.75;
   stroke-linecap: round;
+  pointer-events: stroke;
+  cursor: pointer;
+  transition: opacity 0.15s ease, stroke-width 0.15s ease, filter 0.15s ease;
+}
+
+.df-arrow:hover {
+  opacity: 1;
+  stroke-width: 3 !important;
+  filter: drop-shadow(0 0 3px currentColor);
 }
 
 /* DUT block highlight */
@@ -136,7 +145,7 @@ body {
 }
 
 .df-connections {
-  pointer-events: none;
+  pointer-events: auto;
 }
 
 .df-port-dot {

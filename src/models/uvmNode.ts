@@ -31,6 +31,8 @@ export interface TlmConnection {
   from: string;
   /** e.g. "seqr.seq_item_export" */
   to: string;
+  /** 1-based line number of the .connect() call in the source file */
+  line?: number;
 }
 
 export interface UvmNode {

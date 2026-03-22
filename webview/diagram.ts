@@ -10,7 +10,7 @@
  */
 
 interface TlmPort { kind: string; paramType: string; fieldName: string; }
-interface TlmConnection { from: string; to: string; }
+interface TlmConnection { from: string; to: string; line?: number; }
 interface UvmField { typeName: string; fieldName: string; }
 
 interface UvmDiagramNode {
@@ -100,6 +100,7 @@ interface BlockRect {
 }
 let drawnBlocks: BlockRect[] = [];
 let connectionCounts: Map<string, number> = new Map();
+let containerBounds: { x: number; y: number; w: number; h: number } | null = null;
 const MIN_CONN_SLOT = 16;
 const CONN_MARGIN = 12;
 
@@ -415,6 +416,15 @@ function renderProject(roots: UvmDiagramNode[], duts: DutInfo[]): void {
     drawContainerBox(rootG, envNode, envX, envY, envW, envH);
   }
 
+  // Store container bounds for arrow routing constraints
+  if (testNode) {
+    containerBounds = { x: PAD, y: PAD, w: totalInnerW + PAD, h: envH + testHeaderH + PAD };
+  } else if (envNode) {
+    containerBounds = { x: envX, y: envY, w: envW, h: envH };
+  } else {
+    containerBounds = null;
+  }
+
   // Draw each layout block at its computed position
   for (const { block, x, y } of blockPositions) {
     if (block.type === 'agent-group') {
@@ -647,6 +657,7 @@ interface Arrow {
   from: BlockRect; to: BlockRect;
   label: string; color: string;
   marker: string; dashed: boolean;
+  filePath?: string; line?: number;
 }
 
 function drawAllConnections(parent: SVGGElement, roots: UvmDiagramNode[]): void {
@@ -675,7 +686,7 @@ function drawAllConnections(parent: SVGGElement, roots: UvmDiagramNode[]): void 
       else if (isAnalysis) { label = 'analysis_port'; color = '#d16969'; marker = 'ah-ap'; }
       else { label = portName.length > 18 ? portName.slice(0, 16) + '..' : (portName || 'connect'); color = '#8888cc'; marker = 'ah'; }
 
-      arrows.push({ from: srcBlock, to: dstBlock, label, color, marker, dashed: false });
+      arrows.push({ from: srcBlock, to: dstBlock, label, color, marker, dashed: false, filePath: node.filePath, line: conn.line });
     }
     for (const ch of node.children) processConns(ch);
   };
@@ -980,7 +991,12 @@ function routeDetour(x1: number, y1: number, x2: number, y2: number, obs: BlockR
 
   const minBY = Math.min(...blockers.map(b => b.y));
   const maxBY = Math.max(...blockers.map(b => b.y + b.h));
-  const above = minBY - 30, below = maxBY + 30;
+  let above = minBY - 30, below = maxBY + 30;
+  // Clamp within container bounds
+  if (containerBounds) {
+    above = Math.max(above, containerBounds.y + HEADER_H + 6);
+    below = Math.min(below, containerBounds.y + containerBounds.h - 6);
+  }
   const detourY = (Math.abs(y1 - above) + Math.abs(y2 - above) <
                    Math.abs(y1 - below) + Math.abs(y2 - below)) ? above : below;
 
@@ -1001,7 +1017,11 @@ function routeDetour(x1: number, y1: number, x2: number, y2: number, obs: BlockR
 function routeBackwards(x1: number, y1: number, x2: number, y2: number): Pt[] {
   const allMinY = drawnBlocks.length > 0
     ? Math.min(...drawnBlocks.map(b => b.y), y1, y2) : Math.min(y1, y2);
-  const routeY = Math.round(allMinY - 30);
+  let routeY = Math.round(allMinY - 30);
+  // Clamp within container bounds
+  if (containerBounds) {
+    routeY = Math.max(routeY, containerBounds.y + HEADER_H + 6);
+  }
   const exitX = Math.round(x1 - 15);
   const entryX = Math.round(x2 + 15);
   return [
@@ -1106,12 +1126,25 @@ function drawOrthoArrow(parent: SVGGElement, ra: RoutedArrow): void {
   }
   d += ` L${pts[pts.length - 1].x},${pts[pts.length - 1].y}`;
 
-  parent.appendChild(attrs(el('path'), {
+  const arrowPath = attrs(el('path'), {
     d, class: 'df-arrow',
     stroke: a.color, 'stroke-width': 1.8, fill: 'none',
     'stroke-dasharray': a.dashed ? '6,3' : 'none',
     'marker-end': `url(#${a.marker})`,
-  }));
+  });
+
+  // Click-to-navigate: open the source file at the line of the .connect() call
+  if (a.filePath && a.line) {
+    arrowPath.style.cursor = 'pointer';
+    const title = el('title') as SVGTitleElement;
+    title.textContent = `Click to open connection (line ${a.line})`;
+    arrowPath.appendChild(title);
+    arrowPath.addEventListener('click', () => {
+      vscode.postMessage({ command: 'openFile', filePath: a.filePath, line: a.line });
+    });
+  }
+
+  parent.appendChild(arrowPath);
 
   // Label on longest segment
   if (a.label) {
@@ -1169,32 +1202,59 @@ function absPos(e: SVGElement): { x: number; y: number } {
   return { x, y };
 }
 
-// ─── TLM port indicators ─────────────────────────────────────
+// ─── TLM port indicators (positioned by data direction) ──────
+function isOutputPort(kind: string): boolean {
+  return kind.includes('analysis_port') || kind.includes('put_port') || kind.includes('seq_item_port');
+}
+
 function drawPorts(g: SVGGElement, node: UvmDiagramNode, w: number, h: number, theme: Theme): void {
   if (node.tlmPorts.length === 0) return;
-  const py = h - PORT_AREA_H + PORT_R + 2;
-  const tw = node.tlmPorts.length * PORT_GAP;
-  let sx = (w - tw) / 2 + PORT_GAP / 2;
-  for (const port of node.tlmPorts) {
-    const isExp = port.kind.includes('export') || port.kind.includes('imp');
-    if (isExp) {
-      const sq = attrs(el('rect'), { x: sx - PORT_R, y: py - PORT_R, width: PORT_R * 2, height: PORT_R * 2, rx: 1, fill: theme.accent, stroke: '#fff', 'stroke-width': 0.8 });
+
+  // Separate into output (right) and input (left) ports
+  const rightPorts = node.tlmPorts.filter(p => isOutputPort(p.kind));
+  const leftPorts = node.tlmPorts.filter(p => !isOutputPort(p.kind));
+
+  const drawSidePorts = (ports: TlmPort[], side: 'left' | 'right') => {
+    if (ports.length === 0) return;
+    const x = side === 'right' ? w : 0;
+    const totalH = ports.length * PORT_GAP;
+    let py = (h - totalH) / 2 + PORT_GAP / 2;
+    const anchor = side === 'right' ? 'start' : 'end';
+    const lblX = side === 'right' ? x + PORT_R + 4 : x - PORT_R - 4;
+
+    for (const port of ports) {
+      const isExp = port.kind.includes('export') || port.kind.includes('imp');
       const title = el('title') as SVGTitleElement;
       title.textContent = `${port.fieldName}: ${port.kind} #(${port.paramType})`;
-      sq.appendChild(title);
-      g.appendChild(sq);
-    } else {
-      const c = attrs(el('circle'), { cx: sx, cy: py, r: PORT_R, fill: theme.accent, stroke: '#fff', 'stroke-width': 0.8 });
-      const title = el('title') as SVGTitleElement;
-      title.textContent = `${port.fieldName}: ${port.kind} #(${port.paramType})`;
-      c.appendChild(title);
-      g.appendChild(c);
+
+      if (isExp) {
+        const sq = attrs(el('rect'), {
+          x: x - PORT_R, y: py - PORT_R, width: PORT_R * 2, height: PORT_R * 2,
+          rx: 1, fill: theme.accent, stroke: '#fff', 'stroke-width': 0.8,
+        });
+        sq.appendChild(title);
+        g.appendChild(sq);
+      } else {
+        const c = attrs(el('circle'), {
+          cx: x, cy: py, r: PORT_R,
+          fill: theme.accent, stroke: '#fff', 'stroke-width': 0.8,
+        });
+        c.appendChild(title);
+        g.appendChild(c);
+      }
+
+      const lbl = attrs(el('text'), {
+        x: lblX, y: py + 3, 'text-anchor': anchor,
+        'font-size': 7, fill: '#999', class: 'df-port-label',
+      }) as SVGTextElement;
+      lbl.textContent = port.fieldName.length > 10 ? port.fieldName.slice(0, 9) + '..' : port.fieldName;
+      g.appendChild(lbl);
+      py += PORT_GAP;
     }
-    const lbl = attrs(el('text'), { x: sx, y: py + PORT_R + 9, 'text-anchor': 'middle', 'font-size': 7, fill: '#999', class: 'df-port-label' }) as SVGTextElement;
-    lbl.textContent = port.fieldName.length > 10 ? port.fieldName.slice(0, 9) + '..' : port.fieldName;
-    g.appendChild(lbl);
-    sx += PORT_GAP;
-  }
+  };
+
+  drawSidePorts(leftPorts, 'left');
+  drawSidePorts(rightPorts, 'right');
 }
 
 // ─── Symbolic icons ───────────────────────────────────────────

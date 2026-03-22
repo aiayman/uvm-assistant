@@ -89,7 +89,7 @@ export function regexParse(
     const body = text.slice(match.index, endIdx);
     const fields = extractFields(body, line);
     const tlmPorts = extractTlmPorts(body);
-    const connections = extractConnections(body);
+    const connections = extractConnections(body, line);
     const virtualIfs = extractVirtualInterfaces(body);
 
     uvmClasses.push({
@@ -209,18 +209,22 @@ function extractTlmPorts(classBody: string): TlmPort[] {
   return ports;
 }
 
-function extractConnections(classBody: string): TlmConnection[] {
+function extractConnections(classBody: string, classStartLine: number): TlmConnection[] {
   const connections: TlmConnection[] = [];
   // Match: foo.port.connect(bar.export)  or  foo.connect(bar)
   const connectPhaseMatch = classBody.match(
     /function\s+void\s+connect_phase\s*\(\s*uvm_phase\s+\w+\s*\)\s*;([\s\S]*?)endfunction/,
   );
   if (!connectPhaseMatch) { return connections; }
+  const bodyOffset = connectPhaseMatch.index!;
   const body = connectPhaseMatch[1];
+  const bodyStartOffset = bodyOffset + connectPhaseMatch[0].indexOf(body);
+  const bodyLineIndex = buildLineIndex(classBody);
   const re = /([\w.]+)\s*\.\s*connect\s*\(\s*([\w.]+)\s*\)/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(body)) !== null) {
-    connections.push({ from: m[1], to: m[2] });
+    const localLine = lineAtOffset(bodyLineIndex, bodyStartOffset + m.index);
+    connections.push({ from: m[1], to: m[2], line: classStartLine + localLine });
   }
   return connections;
 }
