@@ -57,6 +57,9 @@ const PORT_AREA_H = 20;
 const CHAR_W = 7.5;
 const DUT_W = 140;
 const DUT_H = 80;
+const TRACK_SPACING = 8;
+const BLOCK_ARROW_GAP = 12;
+const CORNER_R = 3;
 
 // Pipeline stage order (lower = further left)
 const STAGE: Record<string, number> = {
@@ -757,16 +760,17 @@ function drawAllConnections(parent: SVGGElement, roots: UvmDiagramNode[]): void 
   parent.appendChild(cg);
 }
 
-// ─── Arrow routing engine ─────────────────────────────────────
+// ─── Arrow routing engine (orthogonal) ────────────────────────
+
+type Side = 'top' | 'right' | 'bottom' | 'left';
 
 interface RoutedArrow {
   arrow: Arrow;
-  srcSide: 'top' | 'right' | 'bottom' | 'left';
-  tgtSide: 'top' | 'right' | 'bottom' | 'left';
+  srcSide: Side;
+  tgtSide: Side;
   srcX: number; srcY: number;
   tgtX: number; tgtY: number;
-  srcSlotIdx: number; srcSlotCount: number;
-  tgtSlotIdx: number; tgtSlotCount: number;
+  waypoints: { x: number; y: number }[];
 }
 
 function routeAndDrawArrows(parent: SVGGElement, arrows: Arrow[]): void {
@@ -777,34 +781,25 @@ function routeAndDrawArrows(parent: SVGGElement, arrows: Arrow[]): void {
     const fromCy = a.from.y + a.from.h / 2;
     const toCy = a.to.y + a.to.h / 2;
 
-    let srcSide: 'top' | 'right' | 'bottom' | 'left';
-    let tgtSide: 'top' | 'right' | 'bottom' | 'left';
+    let srcSide: Side, tgtSide: Side;
 
-    // Prefer horizontal (left/right) if blocks don't overlap horizontally
     if (a.from.x + a.from.w + 2 < a.to.x) {
-      // Source is left of target → right → left
-      srcSide = 'right';
-      tgtSide = 'left';
+      srcSide = 'right'; tgtSide = 'left';
     } else if (a.to.x + a.to.w + 2 < a.from.x) {
-      // Source is right of target → left → right
-      srcSide = 'left';
-      tgtSide = 'right';
+      srcSide = 'left'; tgtSide = 'right';
     } else if (fromCy <= toCy) {
-      // Vertically stacked — exit bottom, enter top
-      srcSide = 'bottom';
-      tgtSide = 'top';
+      srcSide = 'bottom'; tgtSide = 'top';
     } else {
-      srcSide = 'top';
-      tgtSide = 'bottom';
+      srcSide = 'top'; tgtSide = 'bottom';
     }
 
-    routed.push({ arrow: a, srcSide, tgtSide, srcX: 0, srcY: 0, tgtX: 0, tgtY: 0, srcSlotIdx: 0, srcSlotCount: 1, tgtSlotIdx: 0, tgtSlotCount: 1 });
+    routed.push({ arrow: a, srcSide, tgtSide, srcX: 0, srcY: 0, tgtX: 0, tgtY: 0, waypoints: [] });
   }
 
-  // Step 2: For each block+side, collect connected arrows and distribute points
+  // Step 2: Distribute connection points per block side
   interface SideSlot {
     ra: RoutedArrow;
-    isSource: boolean; // true = outgoing, false = incoming
+    isSource: boolean;
     otherBlock: BlockRect;
   }
 
@@ -821,137 +816,241 @@ function routeAndDrawArrows(parent: SVGGElement, arrows: Arrow[]): void {
     sideMap.get(tgtKey)!.push({ ra, isSource: false, otherBlock: ra.arrow.from });
   }
 
-  // For each side, sort by other endpoint position and assign evenly-spaced points
   for (const [key, slots] of sideMap) {
-    const side = key.split('::')[1] as 'top' | 'right' | 'bottom' | 'left';
-
-    // Find the block for this side
+    const side = key.split('::')[1] as Side;
     const block = slots[0].isSource ? slots[0].ra.arrow.from : slots[0].ra.arrow.to;
 
-    // Sort by other endpoint's center to minimize crossings
     slots.sort((a, b) => {
-      const aCx = a.otherBlock.x + a.otherBlock.w / 2;
       const aCy = a.otherBlock.y + a.otherBlock.h / 2;
-      const bCx = b.otherBlock.x + b.otherBlock.w / 2;
       const bCy = b.otherBlock.y + b.otherBlock.h / 2;
-      if (side === 'right' || side === 'left') {
-        return aCy - bCy; // Sort by Y position of other endpoint
-      } else {
-        return aCx - bCx; // Sort by X position of other endpoint
-      }
+      const aCx = a.otherBlock.x + a.otherBlock.w / 2;
+      const bCx = b.otherBlock.x + b.otherBlock.w / 2;
+      return (side === 'right' || side === 'left') ? aCy - bCy : aCx - bCx;
     });
 
     const count = slots.length;
-    const margin = 12; // minimum margin from block corners
+    const margin = 12;
 
     for (let i = 0; i < count; i++) {
-      // Distribute evenly along the side
       const t = count === 1 ? 0.5 : (margin + ((side === 'right' || side === 'left'
         ? (block.h - 2 * margin)
         : (block.w - 2 * margin)) * i / (count - 1))) / (side === 'right' || side === 'left' ? block.h : block.w);
 
       let px: number, py: number;
       switch (side) {
-        case 'right':
-          px = block.x + block.w;
-          py = block.y + block.h * t;
-          break;
-        case 'left':
-          px = block.x;
-          py = block.y + block.h * t;
-          break;
-        case 'bottom':
-          px = block.x + block.w * t;
-          py = block.y + block.h;
-          break;
-        case 'top':
-          px = block.x + block.w * t;
-          py = block.y;
-          break;
+        case 'right':  px = block.x + block.w; py = block.y + block.h * t; break;
+        case 'left':   px = block.x;           py = block.y + block.h * t; break;
+        case 'bottom': px = block.x + block.w * t; py = block.y + block.h; break;
+        case 'top':    px = block.x + block.w * t; py = block.y; break;
       }
 
       if (slots[i].isSource) {
-        slots[i].ra.srcX = px;
-        slots[i].ra.srcY = py;
-        slots[i].ra.srcSlotIdx = i;
-        slots[i].ra.srcSlotCount = count;
+        slots[i].ra.srcX = px; slots[i].ra.srcY = py;
       } else {
-        slots[i].ra.tgtX = px;
-        slots[i].ra.tgtY = py;
-        slots[i].ra.tgtSlotIdx = i;
-        slots[i].ra.tgtSlotCount = count;
+        slots[i].ra.tgtX = px; slots[i].ra.tgtY = py;
       }
     }
   }
 
-  // Step 3: Draw each arrow with cubic Bezier curves
-  for (const ra of routed) {
-    drawRoutedArrow(parent, ra);
+  // Step 3: Compute orthogonal paths
+  for (const ra of routed) computeOrthoPath(ra);
+
+  // Step 4: Collision avoidance — move vertical segments out of blocks
+  for (const ra of routed) avoidBlockCollisions(ra);
+
+  // Step 5: Deconflict parallel vertical and horizontal tracks
+  deconflictTracks(routed);
+
+  // Step 6: Draw
+  for (const ra of routed) drawOrthoArrow(parent, ra);
+}
+
+// ─── Orthogonal path computation ──────────────────────────────
+
+function computeOrthoPath(ra: RoutedArrow): void {
+  const { srcX: x1, srcY: y1, tgtX: x2, tgtY: y2, srcSide, tgtSide } = ra;
+  const pts: { x: number; y: number }[] = [{ x: x1, y: y1 }];
+
+  if (srcSide === 'right' && tgtSide === 'left') {
+    if (Math.abs(y1 - y2) < 2) {
+      // Straight horizontal
+    } else {
+      const midX = Math.round((x1 + x2) / 2);
+      pts.push({ x: midX, y: y1 });
+      pts.push({ x: midX, y: y2 });
+    }
+  } else if (srcSide === 'left' && tgtSide === 'right') {
+    // Backwards arrow: route above all blocks
+    const minY = drawnBlocks.length > 0
+      ? Math.min(...drawnBlocks.map(b => b.y), y1, y2) : Math.min(y1, y2);
+    const routeY = Math.round(minY - 30);
+    const exitX = Math.round(x1 - 15);
+    const entryX = Math.round(x2 + 15);
+    pts.push({ x: exitX, y: y1 });
+    pts.push({ x: exitX, y: routeY });
+    pts.push({ x: entryX, y: routeY });
+    pts.push({ x: entryX, y: y2 });
+  } else if ((srcSide === 'bottom' && tgtSide === 'top') ||
+             (srcSide === 'top' && tgtSide === 'bottom')) {
+    if (Math.abs(x1 - x2) < 2) {
+      // Straight vertical
+    } else {
+      const midY = Math.round((y1 + y2) / 2);
+      pts.push({ x: x1, y: midY });
+      pts.push({ x: x2, y: midY });
+    }
+  } else {
+    // Mixed sides: L-shape
+    if (srcSide === 'right' || srcSide === 'left') {
+      pts.push({ x: x2, y: y1 });
+    } else {
+      pts.push({ x: x1, y: y2 });
+    }
+  }
+
+  pts.push({ x: x2, y: y2 });
+  ra.waypoints = pts;
+}
+
+// ─── Collision avoidance for vertical segments ────────────────
+
+function avoidBlockCollisions(ra: RoutedArrow): void {
+  const pts = ra.waypoints;
+  // Only Z-shape (4 points) has a vertical segment that might hit intermediate blocks
+  if (pts.length !== 4) return;
+
+  const vx = pts[1].x;
+  const yMin = Math.min(pts[1].y, pts[2].y);
+  const yMax = Math.max(pts[1].y, pts[2].y);
+
+  const isBlocked = (x: number) => drawnBlocks.some(b =>
+    b.node.className !== ra.arrow.from.node.className &&
+    b.node.className !== ra.arrow.to.node.className &&
+    x > b.x - BLOCK_ARROW_GAP && x < b.x + b.w + BLOCK_ARROW_GAP &&
+    yMax > b.y - 4 && yMin < b.y + b.h + 4
+  );
+
+  if (!isBlocked(vx)) return;
+
+  // Search outward for a clear channel, preferring the side closer to the gap
+  for (let offset = TRACK_SPACING; offset < 400; offset += TRACK_SPACING) {
+    if (!isBlocked(vx + offset)) {
+      pts[1].x = vx + offset; pts[2].x = vx + offset; return;
+    }
+    if (!isBlocked(vx - offset)) {
+      pts[1].x = vx - offset; pts[2].x = vx - offset; return;
+    }
   }
 }
 
-function drawRoutedArrow(parent: SVGGElement, ra: RoutedArrow): void {
-  const { arrow: a, srcSide, tgtSide, srcX: x1, srcY: y1, tgtX: x2, tgtY: y2 } = ra;
+// ─── Track deconfliction ──────────────────────────────────────
 
-  const dx = x2 - x1;
-  const dy = y2 - y1;
-  const dist = Math.sqrt(dx * dx + dy * dy) || 1;
-  const baseCpDist = Math.max(30, Math.min(80, dist * 0.35));
-
-  // Vary control point distance per slot to fan out parallel curves
-  const srcFan = ra.srcSlotCount > 1 ? (ra.srcSlotIdx - (ra.srcSlotCount - 1) / 2) * 14 : 0;
-  const tgtFan = ra.tgtSlotCount > 1 ? (ra.tgtSlotIdx - (ra.tgtSlotCount - 1) / 2) * 14 : 0;
-
-  // Control points extend outward from the side, with perpendicular fan offset
-  let cp1x: number, cp1y: number, cp2x: number, cp2y: number;
-
-  switch (srcSide) {
-    case 'right':  cp1x = x1 + baseCpDist + Math.abs(srcFan) * 0.5; cp1y = y1 + srcFan; break;
-    case 'left':   cp1x = x1 - baseCpDist - Math.abs(srcFan) * 0.5; cp1y = y1 + srcFan; break;
-    case 'bottom': cp1x = x1 + srcFan; cp1y = y1 + baseCpDist + Math.abs(srcFan) * 0.5; break;
-    case 'top':    cp1x = x1 + srcFan; cp1y = y1 - baseCpDist - Math.abs(srcFan) * 0.5; break;
+function deconflictTracks(routed: RoutedArrow[]): void {
+  // ── Vertical segments ──
+  interface VSeg { routeIdx: number; x: number; yMin: number; yMax: number }
+  const vSegs: VSeg[] = [];
+  for (let i = 0; i < routed.length; i++) {
+    const pts = routed[i].waypoints;
+    if (pts.length === 4) {
+      vSegs.push({
+        routeIdx: i, x: pts[1].x,
+        yMin: Math.min(pts[1].y, pts[2].y),
+        yMax: Math.max(pts[1].y, pts[2].y),
+      });
+    }
   }
 
-  switch (tgtSide) {
-    case 'right':  cp2x = x2 + baseCpDist + Math.abs(tgtFan) * 0.5; cp2y = y2 + tgtFan; break;
-    case 'left':   cp2x = x2 - baseCpDist - Math.abs(tgtFan) * 0.5; cp2y = y2 + tgtFan; break;
-    case 'bottom': cp2x = x2 + tgtFan; cp2y = y2 + baseCpDist + Math.abs(tgtFan) * 0.5; break;
-    case 'top':    cp2x = x2 + tgtFan; cp2y = y2 - baseCpDist - Math.abs(tgtFan) * 0.5; break;
-  }
-
-  // ── Collision avoidance: route around intermediate blocks ──
-  const possibleBlockers = drawnBlocks.filter(b => {
-    if (b.node.className === a.from.node.className || b.node.className === a.to.node.className) return false;
-    const minX = Math.min(x1, x2) - 10;
-    const maxX = Math.max(x1, x2) + 10;
-    return b.x + b.w > minX && b.x < maxX;
-  });
-
-  if (possibleBlockers.length > 0) {
-    const collidedBlocks: BlockRect[] = [];
-    for (let t = 0.02; t <= 0.98; t += 0.02) {
-      const mt = 1 - t;
-      const px = mt * mt * mt * x1 + 3 * mt * mt * t * cp1x + 3 * mt * t * t * cp2x + t * t * t * x2;
-      const py = mt * mt * mt * y1 + 3 * mt * mt * t * cp1y + 3 * mt * t * t * cp2y + t * t * t * y2;
-      for (const b of possibleBlockers) {
-        if (px > b.x - 4 && px < b.x + b.w + 4 && py > b.y - 4 && py < b.y + b.h + 4) {
-          if (!collidedBlocks.includes(b)) collidedBlocks.push(b);
+  if (vSegs.length > 1) {
+    vSegs.sort((a, b) => a.x - b.x);
+    let i = 0;
+    while (i < vSegs.length) {
+      let j = i + 1;
+      while (j < vSegs.length && vSegs[j].x - vSegs[i].x < TRACK_SPACING * 2) j++;
+      const group = vSegs.slice(i, j);
+      if (group.length > 1 && group.some((a, ai) =>
+        group.some((b, bi) => ai !== bi && a.yMax > b.yMin && a.yMin < b.yMax))) {
+        const centerX = group.reduce((s, v) => s + v.x, 0) / group.length;
+        group.sort((a, b) => (a.yMin + a.yMax) / 2 - (b.yMin + b.yMax) / 2);
+        const totalW = (group.length - 1) * TRACK_SPACING;
+        for (let k = 0; k < group.length; k++) {
+          const newX = Math.round(centerX - totalW / 2 + k * TRACK_SPACING);
+          const pts = routed[group[k].routeIdx].waypoints;
+          pts[1].x = newX; pts[2].x = newX;
         }
       }
-    }
-
-    if (collidedBlocks.length > 0) {
-      const minBlockY = Math.min(...collidedBlocks.map(b => b.y));
-      const maxBlockY = Math.max(...collidedBlocks.map(b => b.y + b.h));
-      const CLEARANCE = 24;
-      const goAbove = (y1 + y2) / 2 <= (minBlockY + maxBlockY) / 2;
-      const routeY = goAbove ? minBlockY - CLEARANCE : maxBlockY + CLEARANCE;
-      cp1y = routeY;
-      cp2y = routeY;
+      i = j;
     }
   }
 
-  const d = `M${x1},${y1} C${cp1x},${cp1y} ${cp2x},${cp2y} ${x2},${y2}`;
+  // ── Horizontal segments ──
+  interface HSeg { routeIdx: number; segIdx: number; y: number; xMin: number; xMax: number }
+  const hSegs: HSeg[] = [];
+  for (let ri = 0; ri < routed.length; ri++) {
+    const pts = routed[ri].waypoints;
+    for (let si = 0; si < pts.length - 1; si++) {
+      if (Math.abs(pts[si].y - pts[si + 1].y) < 1 && Math.abs(pts[si].x - pts[si + 1].x) > 4) {
+        hSegs.push({
+          routeIdx: ri, segIdx: si, y: pts[si].y,
+          xMin: Math.min(pts[si].x, pts[si + 1].x),
+          xMax: Math.max(pts[si].x, pts[si + 1].x),
+        });
+      }
+    }
+  }
+
+  if (hSegs.length > 1) {
+    hSegs.sort((a, b) => a.y - b.y);
+    let i = 0;
+    while (i < hSegs.length) {
+      let j = i + 1;
+      while (j < hSegs.length && Math.abs(hSegs[j].y - hSegs[i].y) < TRACK_SPACING) j++;
+      const group = hSegs.slice(i, j);
+      if (group.length > 1 && group.some((a, ai) =>
+        group.some((b, bi) => ai !== bi && a.xMax > b.xMin && a.xMin < b.xMax))) {
+        const centerY = group.reduce((s, h) => s + h.y, 0) / group.length;
+        group.sort((a, b) => (a.xMin + a.xMax) / 2 - (b.xMin + b.xMax) / 2);
+        const totalH = (group.length - 1) * TRACK_SPACING;
+        for (let k = 0; k < group.length; k++) {
+          const newY = Math.round(centerY - totalH / 2 + k * TRACK_SPACING);
+          const pts = routed[group[k].routeIdx].waypoints;
+          const si = group[k].segIdx;
+          pts[si].y = newY; pts[si + 1].y = newY;
+        }
+      }
+      i = j;
+    }
+  }
+}
+
+// ─── Orthogonal arrow drawing ─────────────────────────────────
+
+function drawOrthoArrow(parent: SVGGElement, ra: RoutedArrow): void {
+  const { arrow: a, waypoints: pts } = ra;
+  if (pts.length < 2) return;
+
+  // Build SVG path with tiny rounded corners at elbows
+  let d = `M${pts[0].x},${pts[0].y}`;
+
+  for (let i = 1; i < pts.length - 1; i++) {
+    const prev = pts[i - 1], curr = pts[i], next = pts[i + 1];
+    const dx1 = curr.x - prev.x, dy1 = curr.y - prev.y;
+    const dx2 = next.x - curr.x, dy2 = next.y - curr.y;
+    const len1 = Math.sqrt(dx1 * dx1 + dy1 * dy1);
+    const len2 = Math.sqrt(dx2 * dx2 + dy2 * dy2);
+    const r = Math.min(CORNER_R, len1 / 2, len2 / 2);
+
+    if (r > 0.5 && len1 > 0 && len2 > 0) {
+      const bx = curr.x - (dx1 / len1) * r;
+      const by = curr.y - (dy1 / len1) * r;
+      const ax = curr.x + (dx2 / len2) * r;
+      const ay = curr.y + (dy2 / len2) * r;
+      d += ` L${bx},${by} Q${curr.x},${curr.y} ${ax},${ay}`;
+    } else {
+      d += ` L${curr.x},${curr.y}`;
+    }
+  }
+
+  d += ` L${pts[pts.length - 1].x},${pts[pts.length - 1].y}`;
 
   parent.appendChild(attrs(el('path'), {
     d,
@@ -961,25 +1060,47 @@ function drawRoutedArrow(parent: SVGGElement, ra: RoutedArrow): void {
     'marker-end': `url(#${a.marker})`,
   }));
 
+  // Label on longest segment
   if (a.label) {
-    // Place label at t=0.3 on cubic Bezier
-    const t = 0.3;
-    const mt = 1 - t;
-    const lx = mt * mt * mt * x1 + 3 * mt * mt * t * cp1x + 3 * mt * t * t * cp2x + t * t * t * x2;
-    const ly = mt * mt * mt * y1 + 3 * mt * mt * t * cp1y + 3 * mt * t * t * cp2y + t * t * t * y2;
+    let bestLen = 0, bestMx = 0, bestMy = 0, isVertical = false;
+    for (let i = 0; i < pts.length - 1; i++) {
+      const dx = pts[i + 1].x - pts[i].x;
+      const dy = pts[i + 1].y - pts[i].y;
+      const len = Math.sqrt(dx * dx + dy * dy);
+      if (len > bestLen) {
+        bestLen = len;
+        bestMx = (pts[i].x + pts[i + 1].x) / 2;
+        bestMy = (pts[i].y + pts[i + 1].y) / 2;
+        isVertical = Math.abs(dy) > Math.abs(dx);
+      }
+    }
+
     const displayLabel = a.label.length > 20 ? a.label.slice(0, 18) + '..' : a.label;
     const tw = displayLabel.length * 5 + 10;
 
-    parent.appendChild(attrs(el('rect'), {
-      x: lx - tw / 2, y: ly - 7, width: tw, height: 14,
-      rx: 3, fill: '#111', opacity: 0.92, stroke: a.color, 'stroke-width': 0.5,
-    }));
-    const lbl = attrs(el('text'), {
-      x: lx, y: ly + 3, 'text-anchor': 'middle',
-      'font-size': 8, fill: a.color, class: 'df-arrow-label',
-    }) as SVGTextElement;
-    lbl.textContent = displayLabel;
-    parent.appendChild(lbl);
+    if (!isVertical) {
+      parent.appendChild(attrs(el('rect'), {
+        x: bestMx - tw / 2, y: bestMy - 15, width: tw, height: 14,
+        rx: 3, fill: '#111', opacity: 0.92, stroke: a.color, 'stroke-width': 0.5,
+      }));
+      const lbl = attrs(el('text'), {
+        x: bestMx, y: bestMy - 5, 'text-anchor': 'middle',
+        'font-size': 8, fill: a.color, class: 'df-arrow-label',
+      }) as SVGTextElement;
+      lbl.textContent = displayLabel;
+      parent.appendChild(lbl);
+    } else {
+      parent.appendChild(attrs(el('rect'), {
+        x: bestMx + 4, y: bestMy - 7, width: tw, height: 14,
+        rx: 3, fill: '#111', opacity: 0.92, stroke: a.color, 'stroke-width': 0.5,
+      }));
+      const lbl = attrs(el('text'), {
+        x: bestMx + 4 + tw / 2, y: bestMy + 3, 'text-anchor': 'middle',
+        'font-size': 8, fill: a.color, class: 'df-arrow-label',
+      }) as SVGTextElement;
+      lbl.textContent = displayLabel;
+      parent.appendChild(lbl);
+    }
   }
 }
 
