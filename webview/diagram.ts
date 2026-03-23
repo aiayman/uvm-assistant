@@ -1,12 +1,12 @@
 /**
- * UVM Data Flow Diagram — pipeline-oriented rendering.
+ * UVM Data Flow Diagram — channel-based placement & routing.
  *
  * Blocks are arranged left-to-right by their role in the UVM data pipeline:
  *   Sequence → Sequencer → Driver → [DUT] → Monitor → Scoreboard
  *
  * Container blocks (test, env, agent) act as grouping boxes.
- * DUT modules are shown inline between driver-side and monitor-side agents.
- * Arrows follow routed paths with distributed connection points to avoid overlap.
+ * Arrows are routed through dedicated channels between columns.
+ * All arrow segments are strictly horizontal or vertical.
  */
 
 interface TlmPort { kind: string; paramType: string; fieldName: string; }
@@ -53,13 +53,18 @@ const TYPE_Y = 32;
 const ICON_SIZE = 16;
 const PORT_R = 5;
 const PORT_GAP = 18;
-const PORT_AREA_H = 20;
 const CHAR_W = 7.5;
 const DUT_W = 140;
 const DUT_H = 80;
 const TRACK_SPACING = 12;
-const BLOCK_ARROW_GAP = 14;
+const BLOCK_ARROW_GAP = 8;
 const PORT_CIRCLE_R = 3.5;
+const PORT_MARGIN = 14;
+const CHILD_GAP = 20;
+const AGENT_PAD = 20;
+const CHANNEL_MIN_W = 40;
+const STUB_LEN = 16;
+const PERIMETER_MARGIN = 16;
 
 // Pipeline stage order (lower = further left)
 const STAGE: Record<string, number> = {
@@ -98,10 +103,6 @@ interface BlockRect {
   stage: number;
 }
 let drawnBlocks: BlockRect[] = [];
-let connectionCounts: Map<string, number> = new Map();
-let containerBounds: { x: number; y: number; w: number; h: number } | null = null;
-const MIN_CONN_SLOT = 16;
-const CONN_MARGIN = 12;
 
 // ─── Project state ────────────────────────────────────────────
 let allProjects: ProjectData[] = [];
@@ -116,7 +117,6 @@ function attrs(e: SVGElement, a: Record<string, string | number>): SVGElement {
 }
 
 // ─── Init ─────────────────────────────────────────────────────
-
 document.addEventListener('DOMContentLoaded', () => {
   svgEl = document.getElementById('diagram') as unknown as SVGSVGElement;
   rootG = el('g') as SVGGElement;
@@ -143,7 +143,6 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-zoom-out')?.addEventListener('click', () => zoom(0.8));
   document.getElementById('btn-reset')?.addEventListener('click', resetView);
 
-  // Project dropdown change handler
   const dropdown = document.getElementById('project-dropdown') as HTMLSelectElement | null;
   if (dropdown) {
     dropdown.addEventListener('change', () => {
@@ -164,7 +163,6 @@ window.addEventListener('message', (ev) => {
     allProjects = projects;
     selectedProjectIndex = 0;
     updateProjectDropdown();
-
     if (projects.length > 0) {
       const p = projects[selectedProjectIndex];
       renderProject(p.roots, p.duts);
@@ -174,16 +172,10 @@ window.addEventListener('message', (ev) => {
   }
 });
 
-// ─── Project dropdown ─────────────────────────────────────────
 function updateProjectDropdown(): void {
   const dropdown = document.getElementById('project-dropdown') as HTMLSelectElement | null;
   if (!dropdown) return;
-
-  if (allProjects.length <= 1) {
-    dropdown.style.display = 'none';
-    return;
-  }
-
+  if (allProjects.length <= 1) { dropdown.style.display = 'none'; return; }
   dropdown.style.display = 'block';
   dropdown.innerHTML = '';
   for (let i = 0; i < allProjects.length; i++) {
@@ -195,17 +187,65 @@ function updateProjectDropdown(): void {
   }
 }
 
-// ─── Connection count estimation ─────────────────────────────
-function estimateConnectionCounts(roots: UvmDiagramNode[], duts: DutInfo[]): Map<string, number> {
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  CORE PIPELINE — Placement, Routing, Drawing                ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+type Pt = { x: number; y: number };
+
+interface Arrow {
+  from: BlockRect; to: BlockRect;
+  label: string; color: string;
+  marker: string; dashed: boolean;
+  filePath?: string; line?: number;
+}
+
+// ─── Helpers ─────────────────────────────────────────────────
+function resolveFieldToClass(parent: UvmDiagramNode, fieldName: string): string | undefined {
+  for (const f of parent.fields) { if (f.fieldName === fieldName) return f.typeName; }
+  for (const ch of parent.children) { if (ch.className.toLowerCase() === fieldName.toLowerCase()) return ch.className; }
+  return undefined;
+}
+function findBlockByClass(className: string): BlockRect | undefined {
+  return drawnBlocks.find(b => b.node.className === className);
+}
+function isOutputPort(kind: string): boolean {
+  return kind.includes('analysis_port') || kind.includes('put_port') || kind.includes('seq_item_port');
+}
+function absPos(e: SVGElement): { x: number; y: number } {
+  let x = 0, y = 0; let cur: SVGElement | null = e;
+  while (cur && cur !== rootG) {
+    const t = cur.getAttribute('transform');
+    if (t) { const m = t.match(/translate\(([\d.-]+),([\d.-]+)\)/); if (m) { x += parseFloat(m[1]); y += parseFloat(m[2]); } }
+    cur = cur.parentElement as SVGElement | null;
+  }
+  return { x, y };
+}
+
+// ─── Measure a leaf component ─────────────────────────────────
+function measureLeaf(node: UvmDiagramNode, connCounts: Map<string, number>): { w: number; h: number } {
+  const textW = node.className.length * CHAR_W + PAD * 2 + ICON_SIZE + 8;
+  const leftCount = connCounts.get(node.className + ':L') || 0;
+  const rightCount = connCounts.get(node.className + ':R') || 0;
+  const portCount = Math.max(leftCount, rightCount, 1);
+  const portH = portCount * PORT_GAP + 2 * PORT_MARGIN;
+  return { w: Math.max(BLOCK_MIN_W, textW), h: Math.max(BLOCK_MIN_H, portH) };
+}
+
+// ─── Connection count pre-pass (counts per side) ─────────────
+function countConnections(roots: UvmDiagramNode[], duts: DutInfo[]): Map<string, number> {
   const counts = new Map<string, number>();
-  const inc = (name: string) => counts.set(name, (counts.get(name) || 0) + 1);
+  const inc = (name: string, side: 'L' | 'R') => {
+    const key = name + ':' + side;
+    counts.set(key, (counts.get(key) || 0) + 1);
+  };
 
   const processConns = (node: UvmDiagramNode) => {
     for (const conn of node.connections) {
       const srcClass = resolveFieldToClass(node, conn.from.split('.')[0]);
       const dstClass = resolveFieldToClass(node, conn.to.split('.')[0]);
-      if (srcClass) inc(srcClass);
-      if (dstClass) inc(dstClass);
+      if (srcClass) inc(srcClass, 'R');
+      if (dstClass) inc(dstClass, 'L');
     }
     for (const ch of node.children) processConns(ch);
   };
@@ -215,7 +255,7 @@ function estimateConnectionCounts(roots: UvmDiagramNode[], duts: DutInfo[]): Map
     if (node.uvmType === 'agent') {
       const drv = node.children.find(c => c.uvmType === 'driver');
       const seqr = node.children.find(c => c.uvmType === 'sequencer');
-      if (drv && seqr) { inc(drv.className); inc(seqr.className); }
+      if (drv && seqr) { inc(seqr.className, 'R'); inc(drv.className, 'L'); }
     }
     for (const ch of node.children) inferAgent(ch);
   };
@@ -223,35 +263,34 @@ function estimateConnectionCounts(roots: UvmDiagramNode[], duts: DutInfo[]): Map
 
   if (duts.length > 0) {
     const collectDM = (n: UvmDiagramNode) => {
-      if (n.uvmType === 'driver' || n.uvmType === 'monitor') {
-        inc(n.className);
-        for (const d of duts) inc(d.moduleName);
-      }
+      if (n.uvmType === 'driver') { inc(n.className, 'R'); for (const d of duts) inc(d.moduleName, 'L'); }
+      if (n.uvmType === 'monitor') { inc(n.className, 'L'); for (const d of duts) inc(d.moduleName, 'R'); }
       for (const ch of n.children) collectDM(ch);
     };
     for (const r of roots) collectDM(r);
   }
 
-  const sbNames: string[] = [];
-  const apNames: string[] = [];
   const collectSbAp = (n: UvmDiagramNode) => {
-    if (n.uvmType === 'scoreboard') sbNames.push(n.className);
-    if ((n.uvmType === 'monitor' || n.uvmType === 'agent') &&
-        n.tlmPorts.some(p => p.kind.includes('analysis'))) apNames.push(n.className);
+    if (n.uvmType === 'scoreboard') inc(n.className, 'L');
+    if ((n.uvmType === 'monitor' || n.uvmType === 'agent') && n.tlmPorts.some(p => p.kind.includes('analysis'))) inc(n.className, 'R');
     for (const ch of n.children) collectSbAp(ch);
   };
   for (const r of roots) collectSbAp(r);
-  for (const sb of sbNames) {
-    for (const _ap of apNames) { inc(sb); }
-  }
-  for (const ap of apNames) {
-    for (const _sb of sbNames) { inc(ap); }
-  }
 
   return counts;
 }
 
-// ─── Render (pipeline layout) ─────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+// ═ PHASE 1: PLACEMENT
+// ═══════════════════════════════════════════════════════════════
+
+interface AgentGroup {
+  agent?: UvmDiagramNode;
+  env?: UvmDiagramNode;
+  test?: UvmDiagramNode;
+  members: UvmDiagramNode[];
+}
+
 function renderProject(roots: UvmDiagramNode[], duts: DutInfo[]): void {
   const empty = document.getElementById('empty-state')!;
   const ctr = document.getElementById('diagram-container')!;
@@ -260,127 +299,96 @@ function renderProject(roots: UvmDiagramNode[], duts: DutInfo[]): void {
   while (rootG.firstChild) rootG.removeChild(rootG.firstChild);
   drawnBlocks = [];
 
-  // Collect ALL leaf components and containers from the UVM tree
+  // Pre-pass: count connections per block per side
+  const connCounts = countConnections(roots, duts);
+
+  // Collect all leaf components from the UVM tree
   const allLeaves: { node: UvmDiagramNode; ancestors: UvmDiagramNode[] }[] = [];
   const collectLeaves = (n: UvmDiagramNode, ancestors: UvmDiagramNode[]) => {
     const pipelineChildren = n.children.filter(c => STAGE[c.uvmType] >= 0);
     const nonPipelineChildren = n.children.filter(c => STAGE[c.uvmType] < 0 && c.children.some(gc => STAGE[gc.uvmType] >= 0));
-
     if (pipelineChildren.length > 0) {
-      for (const ch of pipelineChildren) {
-        allLeaves.push({ node: ch, ancestors: [...ancestors, n] });
-      }
+      for (const ch of pipelineChildren) allLeaves.push({ node: ch, ancestors: [...ancestors, n] });
     }
-    // Recurse into container nodes (agents, envs)
     for (const ch of [...nonPipelineChildren, ...n.children.filter(c => c.uvmType === 'agent' || c.uvmType === 'env')]) {
       collectLeaves(ch, [...ancestors, n]);
     }
-    // If this node has no pipeline children and IS a pipeline stage itself
     if (pipelineChildren.length === 0 && nonPipelineChildren.length === 0 && STAGE[n.uvmType] >= 0) {
       allLeaves.push({ node: n, ancestors });
     }
   };
   for (const r of roots) collectLeaves(r, []);
 
-  // Sort leaves by pipeline stage
-  allLeaves.sort((a, b) => (STAGE[a.node.uvmType] ?? 99) - (STAGE[b.node.uvmType] ?? 99));
-
-  // Group by agent parent (if any)
-  interface AgentGroup {
-    agent?: UvmDiagramNode;
-    env?: UvmDiagramNode;
-    test?: UvmDiagramNode;
-    members: UvmDiagramNode[];
-  }
+  // Group by agent parent
   const agentGroups: AgentGroup[] = [];
   const standaloneLeaves: { node: UvmDiagramNode; env?: UvmDiagramNode; test?: UvmDiagramNode }[] = [];
-
   for (const leaf of allLeaves) {
     const agentAncestor = leaf.ancestors.find(a => a.uvmType === 'agent');
     const envAncestor = leaf.ancestors.find(a => a.uvmType === 'env');
     const testAncestor = leaf.ancestors.find(a => a.uvmType === 'test');
     if (agentAncestor) {
       let group = agentGroups.find(g => g.agent === agentAncestor);
-      if (!group) {
-        group = { agent: agentAncestor, env: envAncestor, test: testAncestor, members: [] };
-        agentGroups.push(group);
-      }
+      if (!group) { group = { agent: agentAncestor, env: envAncestor, test: testAncestor, members: [] }; agentGroups.push(group); }
       if (!group.members.includes(leaf.node)) group.members.push(leaf.node);
     } else {
-      if (!standaloneLeaves.some(s => s.node === leaf.node)) {
-        standaloneLeaves.push({ node: leaf.node, env: envAncestor, test: testAncestor });
-      }
+      if (!standaloneLeaves.some(s => s.node === leaf.node)) standaloneLeaves.push({ node: leaf.node, env: envAncestor, test: testAncestor });
     }
   }
+  for (const g of agentGroups) g.members.sort((a, b) => (STAGE[a.uvmType] ?? 99) - (STAGE[b.uvmType] ?? 99));
 
-  // Sort members within each agent group by pipeline stage
-  for (const g of agentGroups) {
-    g.members.sort((a, b) => (STAGE[a.uvmType] ?? 99) - (STAGE[b.uvmType] ?? 99));
-  }
-
-  // Estimate connection counts for block sizing
-  connectionCounts = estimateConnectionCounts(roots, duts);
-
-  // ── Build the pipeline layout ──
-  const envNode = roots.find(r => r.uvmType === 'test')?.children.find(c => c.uvmType === 'env')
-    || roots.find(r => r.uvmType === 'env');
-  const testNode = roots.find(r => r.uvmType === 'test');
-
-  // Measure all agent groups and standalone blocks
+  // ── Build column-based layout ──
   interface LayoutBlock {
     type: 'agent-group' | 'dut' | 'standalone' | 'sequence-group';
     stage: number;
-    w: number;
-    h: number;
+    w: number; h: number;
     data: any;
   }
-
   const layoutBlocks: LayoutBlock[] = [];
 
-  // Add agent groups (each agent is a column with its members stacked vertically)
+  // Agent groups
   for (const g of agentGroups) {
-    const memberSizes = g.members.map(m => measureLeaf(m));
-    const w = Math.max(BLOCK_MIN_W + 20, ...memberSizes.map(s => s.w)) + PAD * 2;
-    const h = HEADER_H + memberSizes.reduce((s, m) => s + m.h + GAP_Y, 0) - GAP_Y + PAD * 2;
+    const memberSizes = g.members.map(m => measureLeaf(m, connCounts));
+    const w = Math.max(BLOCK_MIN_W + 20, ...memberSizes.map(s => s.w)) + AGENT_PAD * 2;
+    const h = HEADER_H + memberSizes.reduce((s, m) => s + m.h + CHILD_GAP, 0) - CHILD_GAP + AGENT_PAD * 2;
     const minStage = Math.min(...g.members.map(m => STAGE[m.uvmType] ?? 3));
     layoutBlocks.push({ type: 'agent-group', stage: minStage, w, h, data: g });
   }
 
-  // Add DUTs between agents
+  // DUTs
   for (const dut of duts) {
-    const dutConnCount = connectionCounts.get(dut.moduleName) || 0;
-    const dutConnH = dutConnCount > 1 ? dutConnCount * MIN_CONN_SLOT + 2 * CONN_MARGIN : 0;
-    const dutH = Math.max(DUT_H, dutConnH);
+    const leftCount = connCounts.get(dut.moduleName + ':L') || 0;
+    const rightCount = connCounts.get(dut.moduleName + ':R') || 0;
+    const portH = Math.max(leftCount, rightCount, 1) * PORT_GAP + 2 * PORT_MARGIN;
+    const dutH = Math.max(DUT_H, portH);
     layoutBlocks.push({ type: 'dut', stage: 3, w: DUT_W, h: dutH, data: dut });
   }
 
-  // Separate sequences from other standalone leaves and group them vertically
+  // Sequences grouped vertically
   const seqLeaves = standaloneLeaves.filter(s => s.node.uvmType === 'sequence');
   const nonSeqLeaves = standaloneLeaves.filter(s => s.node.uvmType !== 'sequence');
-
   if (seqLeaves.length > 1) {
-    // Stack sequences vertically in a group
-    const memberSizes = seqLeaves.map(s => measureLeaf(s.node));
+    const memberSizes = seqLeaves.map(s => measureLeaf(s.node, connCounts));
     const w = Math.max(BLOCK_MIN_W + 20, ...memberSizes.map(s => s.w)) + PAD * 2;
     const h = HEADER_H + memberSizes.reduce((s, m) => s + m.h + GAP_Y, 0) - GAP_Y + PAD * 2;
     layoutBlocks.push({ type: 'sequence-group', stage: 0, w, h, data: seqLeaves });
   } else {
     for (const s of seqLeaves) {
-      const sz = measureLeaf(s.node);
+      const sz = measureLeaf(s.node, connCounts);
       layoutBlocks.push({ type: 'standalone', stage: 0, w: sz.w, h: sz.h, data: s });
     }
   }
 
-  // Add non-sequence standalone blocks
+  // Non-sequence standalones
   for (const s of nonSeqLeaves) {
-    const sz = measureLeaf(s.node);
+    const sz = measureLeaf(s.node, connCounts);
     layoutBlocks.push({ type: 'standalone', stage: STAGE[s.node.uvmType] ?? 5, w: sz.w, h: sz.h, data: s });
   }
 
-  // Sort by pipeline stage
   layoutBlocks.sort((a, b) => a.stage - b.stage);
 
-  // Compute positions: left-to-right by stage
+  // ── Column grid with routing channels ──
+  const envNode = roots.find(r => r.uvmType === 'test')?.children.find(c => c.uvmType === 'env') || roots.find(r => r.uvmType === 'env');
+  const testNode = roots.find(r => r.uvmType === 'test');
   const envHeaderH = envNode ? HEADER_H : 0;
   const testHeaderH = testNode ? HEADER_H : 0;
 
@@ -389,17 +397,23 @@ function renderProject(roots: UvmDiagramNode[], duts: DutInfo[]): void {
   const maxBlockH = Math.max(DUT_H, ...layoutBlocks.map(b => b.h));
 
   const blockPositions: { block: LayoutBlock; x: number; y: number }[] = [];
+  let prevStage = -999;
 
   for (const block of layoutBlocks) {
+    // Add routing channel between stage columns
+    if (prevStage >= 0 && block.stage > prevStage) {
+      curX += CHANNEL_MIN_W;
+    }
     const y = baseY + (maxBlockH - block.h) / 2;
     blockPositions.push({ block, x: curX, y });
     curX += block.w + GAP_X;
+    prevStage = block.stage;
   }
 
   const totalInnerW = curX - GAP_X + PAD;
   const totalInnerH = maxBlockH + PAD * 2;
 
-  // Draw container boxes (test, env) first
+  // Draw container boxes
   const envX = PAD + (testNode ? PAD : 0);
   const envY = PAD + testHeaderH;
   const envW = totalInnerW - (testNode ? PAD : 0);
@@ -410,254 +424,165 @@ function renderProject(roots: UvmDiagramNode[], duts: DutInfo[]): void {
     const testH = envH + testHeaderH + PAD;
     drawContainerBox(rootG, testNode, PAD, PAD, testW, testH);
   }
+  if (envNode) drawContainerBox(rootG, envNode, envX, envY, envW, envH);
 
-  if (envNode) {
-    drawContainerBox(rootG, envNode, envX, envY, envW, envH);
-  }
-
-  // Store container bounds for arrow routing constraints
-  if (testNode) {
-    containerBounds = { x: PAD, y: PAD, w: totalInnerW + PAD, h: envH + testHeaderH + PAD };
-  } else if (envNode) {
-    containerBounds = { x: envX, y: envY, w: envW, h: envH };
-  } else {
-    containerBounds = null;
-  }
-
-  // Draw each layout block at its computed position
+  // Draw each layout block
   for (const { block, x, y } of blockPositions) {
     if (block.type === 'agent-group') {
-      const g = block.data as AgentGroup;
-      drawAgentGroup(rootG, g, x, y, block.w, block.h);
+      drawAgentGroup(rootG, block.data as AgentGroup, x, y, block.w, block.h, connCounts);
     } else if (block.type === 'dut') {
-      const dut = block.data as DutInfo;
-      drawDutBlock(rootG, dut, x, y, block.w, block.h);
+      drawDutBlock(rootG, block.data as DutInfo, x, y, block.w, block.h);
     } else if (block.type === 'sequence-group') {
-      const seqs = block.data as { node: UvmDiagramNode }[];
-      drawSequenceGroup(rootG, seqs, x, y, block.w, block.h);
+      drawSequenceGroup(rootG, block.data as { node: UvmDiagramNode }[], x, y, block.w, block.h, connCounts);
     } else {
-      const s = block.data as { node: UvmDiagramNode };
-      drawLeafBlock(rootG, s.node, x, y);
+      drawLeafBlock(rootG, (block.data as { node: UvmDiagramNode }).node, x, y, connCounts);
     }
   }
 
-  // Draw connections
+  // Phase 2: Route and draw connections
   drawAllConnections(rootG, roots);
 
-  // Legend (HTML overlay instead of SVG)
   drawLegendOverlay();
-
   resetView();
 }
 
-// ─── Measure a leaf component ─────────────────────────────────
-function measureLeaf(node: UvmDiagramNode): { w: number; h: number } {
-  const textW = node.className.length * CHAR_W + PAD * 2 + ICON_SIZE + 8;
-  const portH = node.tlmPorts.length > 0 ? PORT_AREA_H : 0;
-  const baseH = BLOCK_MIN_H + portH;
-  const connCount = connectionCounts.get(node.className) || 0;
-  const connH = connCount > 1 ? connCount * MIN_CONN_SLOT + 2 * CONN_MARGIN : 0;
-  return { w: Math.max(BLOCK_MIN_W, textW), h: Math.max(baseH, connH) };
-}
+// ═══════════════════════════════════════════════════════════════
+// ═ BLOCK DRAWING
+// ═══════════════════════════════════════════════════════════════
 
-// ─── Draw a container box (test/env — no nesting logic, just a labeled rect) ──
 function drawContainerBox(parent: SVGGElement, node: UvmDiagramNode, x: number, y: number, w: number, h: number): void {
   const g = el('g') as SVGGElement;
   g.setAttribute('transform', `translate(${x},${y})`);
   g.setAttribute('class', `df-block df-${node.uvmType}`);
   const theme = THEMES[node.uvmType] || THEMES.unknown;
-
-  g.appendChild(attrs(el('rect'), {
-    x: 0, y: 0, width: w, height: h, rx: 8,
-    fill: theme.fill, stroke: theme.stroke, 'stroke-width': 2, opacity: 0.6,
-  }));
+  g.appendChild(attrs(el('rect'), { x: 0, y: 0, width: w, height: h, rx: 8, fill: theme.fill, stroke: theme.stroke, 'stroke-width': 2, opacity: 0.6 }));
   const lbl = attrs(el('text'), { x: PAD / 2, y: LABEL_Y, class: 'df-label' }) as SVGTextElement;
-  lbl.textContent = node.className;
-  g.appendChild(lbl);
+  lbl.textContent = node.className; g.appendChild(lbl);
   const badge = attrs(el('text'), { x: PAD / 2, y: TYPE_Y, class: 'df-type' }) as SVGTextElement;
-  badge.textContent = `[${node.uvmType}]`;
-  g.appendChild(badge);
+  badge.textContent = `[${node.uvmType}]`; g.appendChild(badge);
   drawIcon(g, node.uvmType, w, theme.accent);
-
-  g.addEventListener('click', (e) => {
-    e.stopPropagation();
-    vscode.postMessage({ command: 'openFile', filePath: node.filePath, line: node.line });
-  });
-
+  g.addEventListener('click', (e) => { e.stopPropagation(); vscode.postMessage({ command: 'openFile', filePath: node.filePath, line: node.line }); });
   parent.appendChild(g);
 }
 
-// ─── Draw an agent group (agent container + its pipeline members) ──
-function drawAgentGroup(parent: SVGGElement, group: { agent?: UvmDiagramNode; members: UvmDiagramNode[] }, x: number, y: number, w: number, h: number): void {
+function drawAgentGroup(parent: SVGGElement, group: AgentGroup, x: number, y: number, w: number, h: number, connCounts: Map<string, number>): void {
   const g = el('g') as SVGGElement;
   g.setAttribute('transform', `translate(${x},${y})`);
-
   if (group.agent) {
     const theme = THEMES.agent;
-    g.setAttribute('class', `df-block df-agent`);
-    g.appendChild(attrs(el('rect'), {
-      x: 0, y: 0, width: w, height: h, rx: 6,
-      fill: theme.fill, stroke: theme.stroke, 'stroke-width': 2,
-    }));
+    g.setAttribute('class', 'df-block df-agent');
+    g.appendChild(attrs(el('rect'), { x: 0, y: 0, width: w, height: h, rx: 6, fill: theme.fill, stroke: theme.stroke, 'stroke-width': 2 }));
     const lbl = attrs(el('text'), { x: PAD / 2, y: LABEL_Y, class: 'df-label' }) as SVGTextElement;
-    lbl.textContent = group.agent.className;
-    g.appendChild(lbl);
+    lbl.textContent = group.agent.className; g.appendChild(lbl);
     const badge = attrs(el('text'), { x: PAD / 2, y: TYPE_Y, class: 'df-type' }) as SVGTextElement;
-    badge.textContent = '[agent]';
-    g.appendChild(badge);
+    badge.textContent = '[agent]'; g.appendChild(badge);
     drawIcon(g, 'agent', w, theme.accent);
-
-    g.addEventListener('click', (e) => {
-      e.stopPropagation();
-      vscode.postMessage({ command: 'openFile', filePath: group.agent!.filePath, line: group.agent!.line });
-    });
+    g.addEventListener('click', (e) => { e.stopPropagation(); vscode.postMessage({ command: 'openFile', filePath: group.agent!.filePath, line: group.agent!.line }); });
   }
-
-  // Draw members stacked vertically within the agent
   let my = HEADER_H;
   for (const member of group.members) {
-    const sz = measureLeaf(member);
-    const mx = PAD;
-    drawLeafBlock(g, member, mx, my);
-    my += sz.h + GAP_Y;
+    const sz = measureLeaf(member, connCounts);
+    drawLeafBlock(g, member, AGENT_PAD, my, connCounts);
+    my += sz.h + CHILD_GAP;
   }
-
   parent.appendChild(g);
-
-  // Register agent block for connections
   const abs = absPos(g);
-  if (group.agent) {
-    drawnBlocks.push({ x: abs.x, y: abs.y, w, h, node: group.agent, kind: 'uvm', stage: -1 });
-  }
+  if (group.agent) drawnBlocks.push({ x: abs.x, y: abs.y, w, h, node: group.agent, kind: 'uvm', stage: -1 });
 }
 
-// ─── Draw a sequence group (stacked sequences) ───────────────
-function drawSequenceGroup(parent: SVGGElement, seqs: { node: UvmDiagramNode }[], x: number, y: number, w: number, h: number): void {
+function drawSequenceGroup(parent: SVGGElement, seqs: { node: UvmDiagramNode }[], x: number, y: number, w: number, h: number, connCounts: Map<string, number>): void {
   const g = el('g') as SVGGElement;
   g.setAttribute('transform', `translate(${x},${y})`);
-
-  const theme = THEMES.sequence;
-  g.setAttribute('class', 'df-block df-sequence-group');
-  g.appendChild(attrs(el('rect'), {
-    x: 0, y: 0, width: w, height: h, rx: 6,
-    fill: 'rgba(21,42,42,0.5)', stroke: theme.stroke, 'stroke-width': 1, 'stroke-dasharray': '4,2',
-  }));
-  const lbl = attrs(el('text'), { x: PAD / 2, y: LABEL_Y, class: 'df-label' }) as SVGTextElement;
-  lbl.textContent = 'Sequences';
-  g.appendChild(lbl);
-  const badge = attrs(el('text'), { x: PAD / 2, y: TYPE_Y, class: 'df-type' }) as SVGTextElement;
-  badge.textContent = `[${seqs.length} sequences]`;
-  g.appendChild(badge);
-
-  let my = HEADER_H;
+  g.setAttribute('class', 'df-block');
+  g.appendChild(attrs(el('rect'), { x: 0, y: 0, width: w, height: h, rx: 6, fill: '#0a1a1a', stroke: '#445', 'stroke-width': 1, 'stroke-dasharray': '4,2' }));
+  let my = PAD;
   for (const s of seqs) {
-    const sz = measureLeaf(s.node);
-    drawLeafBlock(g, s.node, PAD, my);
-    my += sz.h + GAP_Y;
+    drawLeafBlock(g, s.node, PAD, my, connCounts);
+    my += measureLeaf(s.node, connCounts).h + GAP_Y;
   }
-
   parent.appendChild(g);
 }
 
-// ─── Draw a leaf block (sequencer, driver, monitor, scoreboard, etc.) ──
-function drawLeafBlock(parent: SVGGElement, node: UvmDiagramNode, x: number, y: number): void {
-  const sz = measureLeaf(node);
+function drawLeafBlock(parent: SVGGElement, node: UvmDiagramNode, x: number, y: number, connCounts: Map<string, number>): void {
+  const sz = measureLeaf(node, connCounts);
   const g = el('g') as SVGGElement;
   g.setAttribute('transform', `translate(${x},${y})`);
   g.setAttribute('class', `df-block df-${node.uvmType}`);
   g.setAttribute('data-class', node.className);
   const theme = THEMES[node.uvmType] || THEMES.unknown;
-
-  g.appendChild(attrs(el('rect'), {
-    x: 0, y: 0, width: sz.w, height: sz.h, rx: 6,
-    fill: theme.fill, stroke: theme.stroke, 'stroke-width': 2,
-  }));
+  g.appendChild(attrs(el('rect'), { x: 0, y: 0, width: sz.w, height: sz.h, rx: 6, fill: theme.fill, stroke: theme.stroke, 'stroke-width': 2 }));
   const lbl = attrs(el('text'), { x: PAD / 2, y: LABEL_Y, class: 'df-label' }) as SVGTextElement;
-  lbl.textContent = node.className;
-  g.appendChild(lbl);
+  lbl.textContent = node.className; g.appendChild(lbl);
   const badge = attrs(el('text'), { x: PAD / 2, y: TYPE_Y, class: 'df-type' }) as SVGTextElement;
-  badge.textContent = `[${node.uvmType}]`;
-  g.appendChild(badge);
+  badge.textContent = `[${node.uvmType}]`; g.appendChild(badge);
   drawIcon(g, node.uvmType, sz.w, theme.accent);
   drawPorts(g, node, sz.w, sz.h, theme);
-
-  g.addEventListener('click', (e) => {
-    e.stopPropagation();
-    vscode.postMessage({ command: 'openFile', filePath: node.filePath, line: node.line });
-  });
-
+  g.addEventListener('click', (e) => { e.stopPropagation(); vscode.postMessage({ command: 'openFile', filePath: node.filePath, line: node.line }); });
   parent.appendChild(g);
   const abs = absPos(g);
   drawnBlocks.push({ x: abs.x, y: abs.y, w: sz.w, h: sz.h, node, kind: 'uvm', stage: STAGE[node.uvmType] ?? 3 });
 }
 
-// ─── Draw DUT block ──────────────────────────────────────────
 function drawDutBlock(parent: SVGGElement, dut: DutInfo, x: number, y: number, w: number, h: number): void {
   const g = el('g') as SVGGElement;
   g.setAttribute('transform', `translate(${x},${y})`);
   g.setAttribute('class', 'df-block df-dut');
   const theme = THEMES.dut;
-
-  g.appendChild(attrs(el('rect'), {
-    x: 0, y: 0, width: w, height: h, rx: 4,
-    fill: theme.fill, stroke: theme.stroke, 'stroke-width': 3,
-  }));
-  g.appendChild(attrs(el('rect'), {
-    x: 4, y: 4, width: w - 8, height: h - 8, rx: 3,
-    fill: 'none', stroke: theme.stroke, 'stroke-width': 1, opacity: 0.4,
-  }));
-
+  g.appendChild(attrs(el('rect'), { x: 0, y: 0, width: w, height: h, rx: 4, fill: theme.fill, stroke: theme.stroke, 'stroke-width': 3 }));
+  g.appendChild(attrs(el('rect'), { x: 4, y: 4, width: w - 8, height: h - 8, rx: 3, fill: 'none', stroke: theme.stroke, 'stroke-width': 1, opacity: 0.4 }));
   const textBaseY = h / 2 - 14;
   const lbl = attrs(el('text'), { x: w / 2, y: textBaseY, 'text-anchor': 'middle', class: 'df-label' }) as SVGTextElement;
-  lbl.textContent = dut.moduleName;
-  g.appendChild(lbl);
-  const badge = attrs(el('text'), { x: w / 2, y: textBaseY + 16, 'text-anchor': 'middle', class: 'df-type', fill: theme.accent }) as SVGTextElement;
-  badge.textContent = '[DUT]';
-  g.appendChild(badge);
+  lbl.textContent = dut.moduleName; g.appendChild(lbl);
+  const badge2 = attrs(el('text'), { x: w / 2, y: textBaseY + 16, 'text-anchor': 'middle', class: 'df-type', fill: theme.accent }) as SVGTextElement;
+  badge2.textContent = '[DUT]'; g.appendChild(badge2);
   if (dut.instanceName) {
     const inst = attrs(el('text'), { x: w / 2, y: textBaseY + 32, 'text-anchor': 'middle', 'font-size': 9, fill: '#999' }) as SVGTextElement;
-    inst.textContent = `inst: ${dut.instanceName}`;
-    g.appendChild(inst);
+    inst.textContent = `inst: ${dut.instanceName}`; g.appendChild(inst);
   }
   drawIcon(g, 'dut', w, theme.accent);
-
-  g.addEventListener('click', (e) => {
-    e.stopPropagation();
-    vscode.postMessage({ command: 'openFile', filePath: dut.filePath, line: dut.line });
-  });
-
+  g.addEventListener('click', (e) => { e.stopPropagation(); vscode.postMessage({ command: 'openFile', filePath: dut.filePath, line: dut.line }); });
   parent.appendChild(g);
-
-  const dutNode: UvmDiagramNode = {
-    className: dut.moduleName, uvmType: 'dut', baseClass: '', filePath: dut.filePath,
-    line: dut.line, children: [], fields: [], tlmPorts: [], connections: [], virtualIfs: [],
-  };
+  const dutNode: UvmDiagramNode = { className: dut.moduleName, uvmType: 'dut', baseClass: '', filePath: dut.filePath, line: dut.line, children: [], fields: [], tlmPorts: [], connections: [], virtualIfs: [] };
   const abs = absPos(g);
   drawnBlocks.push({ x: abs.x, y: abs.y, w, h, node: dutNode, kind: 'dut', stage: 3 });
 }
 
-// ─── Connection system (improved routing) ─────────────────────
+function drawPorts(g: SVGGElement, node: UvmDiagramNode, w: number, h: number, theme: Theme): void {
+  if (node.tlmPorts.length === 0) return;
+  const rightPorts = node.tlmPorts.filter(p => isOutputPort(p.kind));
+  const leftPorts = node.tlmPorts.filter(p => !isOutputPort(p.kind));
 
-function resolveFieldToClass(parent: UvmDiagramNode, fieldName: string): string | undefined {
-  for (const f of parent.fields) {
-    if (f.fieldName === fieldName) return f.typeName;
-  }
-  for (const ch of parent.children) {
-    if (ch.className.toLowerCase() === fieldName.toLowerCase()) return ch.className;
-  }
-  return undefined;
+  const drawSidePorts = (ports: TlmPort[], side: 'left' | 'right') => {
+    if (ports.length === 0) return;
+    const x = side === 'right' ? w : 0;
+    const totalH = ports.length * PORT_GAP;
+    let py = (h - totalH) / 2 + PORT_GAP / 2;
+    const anchor = side === 'right' ? 'start' : 'end';
+    const lblX = side === 'right' ? x + PORT_R + 4 : x - PORT_R - 4;
+    for (const port of ports) {
+      const isExp = port.kind.includes('export') || port.kind.includes('imp');
+      const title = el('title') as SVGTitleElement;
+      title.textContent = `${port.fieldName}: ${port.kind} #(${port.paramType})`;
+      if (isExp) {
+        const sq = attrs(el('rect'), { x: x - PORT_R, y: py - PORT_R, width: PORT_R * 2, height: PORT_R * 2, rx: 1, fill: theme.accent, stroke: '#fff', 'stroke-width': 0.8 });
+        sq.appendChild(title); g.appendChild(sq);
+      } else {
+        const c = attrs(el('circle'), { cx: x, cy: py, r: PORT_R, fill: theme.accent, stroke: '#fff', 'stroke-width': 0.8 });
+        c.appendChild(title); g.appendChild(c);
+      }
+      const lbl = attrs(el('text'), { x: lblX, y: py + 3, 'text-anchor': anchor, 'font-size': 7, fill: '#999', class: 'df-port-label' }) as SVGTextElement;
+      lbl.textContent = port.fieldName.length > 10 ? port.fieldName.slice(0, 9) + '..' : port.fieldName;
+      g.appendChild(lbl);
+      py += PORT_GAP;
+    }
+  };
+  drawSidePorts(leftPorts, 'left');
+  drawSidePorts(rightPorts, 'right');
 }
 
-function findBlockByClass(className: string): BlockRect | undefined {
-  return drawnBlocks.find(b => b.node.className === className);
-}
-
-interface Arrow {
-  from: BlockRect; to: BlockRect;
-  label: string; color: string;
-  marker: string; dashed: boolean;
-  filePath?: string; line?: number;
-}
+// ═══════════════════════════════════════════════════════════════
+// ═ PHASE 2: ROUTING
+// ═══════════════════════════════════════════════════════════════
 
 function drawAllConnections(parent: SVGGElement, roots: UvmDiagramNode[]): void {
   const arrows: Arrow[] = [];
@@ -670,15 +595,13 @@ function drawAllConnections(parent: SVGGElement, roots: UvmDiagramNode[]): void 
       const srcClass = resolveFieldToClass(node, fromParts[0]);
       const dstClass = resolveFieldToClass(node, toParts[0]);
       if (!srcClass || !dstClass) continue;
-
       const srcBlock = findBlockByClass(srcClass);
       const dstBlock = findBlockByClass(dstClass);
       if (!srcBlock || !dstBlock || srcBlock === dstBlock) continue;
 
       const portName = fromParts.length > 1 ? fromParts[fromParts.length - 1] : '';
       const isSeqItem = portName.includes('seq_item') || conn.to.includes('seq_item');
-      const isAnalysis = portName.includes('analysis') || conn.to.includes('analysis') ||
-                         portName.includes('_ap') || conn.to.includes('_fifo');
+      const isAnalysis = portName.includes('analysis') || conn.to.includes('analysis') || portName.includes('_ap') || conn.to.includes('_fifo');
 
       let label: string, color: string, marker: string;
       if (isSeqItem) { label = 'seq_item_port'; color = '#c586c0'; marker = 'ah-seq'; }
@@ -699,10 +622,8 @@ function drawAllConnections(parent: SVGGElement, roots: UvmDiagramNode[]): void 
       if (drv && seqr) {
         const drvB = findBlockByClass(drv.className);
         const seqrB = findBlockByClass(seqr.className);
-        if (drvB && seqrB && !arrows.some(a =>
-          (a.from === drvB && a.to === seqrB) || (a.from === seqrB && a.to === drvB))) {
+        if (drvB && seqrB && !arrows.some(a => (a.from === drvB && a.to === seqrB) || (a.from === seqrB && a.to === drvB)))
           arrows.push({ from: seqrB, to: drvB, label: 'seq_item_port', color: '#c586c0', marker: 'ah-seq', dashed: false, filePath: drv.filePath, line: drv.line });
-        }
       }
     }
     for (const ch of node.children) inferAgent(ch);
@@ -725,19 +646,13 @@ function drawAllConnections(parent: SVGGElement, roots: UvmDiagramNode[]): void 
     for (const comp of components) {
       let vif = '';
       if (comp.node.virtualIfs.length > 0) vif = comp.node.virtualIfs[0];
-      else if (comp.parentAgent) {
-        for (const ch of comp.parentAgent.children) {
-          if (ch.virtualIfs.length > 0) { vif = ch.virtualIfs[0]; break; }
-        }
-      }
+      else if (comp.parentAgent) { for (const ch of comp.parentAgent.children) { if (ch.virtualIfs.length > 0) { vif = ch.virtualIfs[0]; break; } } }
       const label = vif || 'vif';
       const dut = dutBlocks.length === 1 ? dutBlocks[0] : nearest(comp.block, dutBlocks);
-
-      if (comp.node.uvmType === 'driver') {
+      if (comp.node.uvmType === 'driver')
         arrows.push({ from: comp.block, to: dut, label, color: '#e6b422', marker: 'ah-dut', dashed: true, filePath: comp.node.filePath, line: comp.node.line });
-      } else {
+      else
         arrows.push({ from: dut, to: comp.block, label, color: '#e6b422', marker: 'ah-dut', dashed: true, filePath: comp.node.filePath, line: comp.node.line });
-      }
     }
   }
 
@@ -747,15 +662,13 @@ function drawAllConnections(parent: SVGGElement, roots: UvmDiagramNode[]): void 
   for (const sb of sbBlocks) {
     if (!arrows.some(a => a.to === sb)) {
       for (const ag of agentBlocks) {
-        if (ag.node.tlmPorts.some(p => p.kind.includes('analysis'))) {
+        if (ag.node.tlmPorts.some(p => p.kind.includes('analysis')))
           arrows.push({ from: ag, to: sb, label: 'analysis_port', color: '#d16969', marker: 'ah-ap', dashed: false, filePath: ag.node.filePath, line: ag.node.line });
-        }
       }
       if (!arrows.some(a => a.to === sb)) {
         const monBlocks = drawnBlocks.filter(b => b.node.uvmType === 'monitor' && b.node.tlmPorts.some(p => p.kind.includes('analysis')));
-        for (const mon of monBlocks) {
+        for (const mon of monBlocks)
           arrows.push({ from: mon, to: sb, label: 'analysis_port', color: '#d16969', marker: 'ah-ap', dashed: false, filePath: mon.node.filePath, line: mon.node.line });
-        }
       }
     }
   }
@@ -764,104 +677,176 @@ function drawAllConnections(parent: SVGGElement, roots: UvmDiagramNode[]): void 
 
   const cg = el('g') as SVGGElement;
   cg.setAttribute('class', 'df-connections');
-
-  // ── Improved arrow routing: distribute connection points per block side ──
   routeAndDrawArrows(cg, arrows);
-
   parent.appendChild(cg);
 }
 
-// ─── Arrow routing engine (orthogonal) ────────────────────────
+function nearest(block: BlockRect, targets: BlockRect[]): BlockRect {
+  let best = targets[0]; let minD = Infinity;
+  const cx = block.x + block.w / 2, cy = block.y + block.h / 2;
+  for (const t of targets) {
+    const d = (t.x + t.w / 2 - cx) ** 2 + (t.y + t.h / 2 - cy) ** 2;
+    if (d < minD) { minD = d; best = t; }
+  }
+  return best;
+}
 
-type Side = 'top' | 'right' | 'bottom' | 'left';
+// ─── Channel-based orthogonal router ──────────────────────────
 
 interface RoutedArrow {
   arrow: Arrow;
-  srcSide: Side;
-  tgtSide: Side;
   srcX: number; srcY: number;
   tgtX: number; tgtY: number;
-  waypoints: { x: number; y: number }[];
+  waypoints: Pt[];
 }
 
 function routeAndDrawArrows(parent: SVGGElement, arrows: Arrow[]): void {
-  // Step 1: Determine preferred exit/entry sides for each arrow
   const routed: RoutedArrow[] = [];
-
   for (const a of arrows) {
-    // CONSTRAINT2/3: output ports always RIGHT, input ports always LEFT
-    const srcSide: Side = 'right';
-    const tgtSide: Side = 'left';
-
-    routed.push({ arrow: a, srcSide, tgtSide, srcX: 0, srcY: 0, tgtX: 0, tgtY: 0, waypoints: [] });
+    routed.push({ arrow: a, srcX: 0, srcY: 0, tgtX: 0, tgtY: 0, waypoints: [] });
   }
 
-  // Step 2: Distribute connection points per block side with PORT_GAP spacing
-  interface SideSlot {
-    ra: RoutedArrow;
-    isSource: boolean;
-    otherBlock: BlockRect;
-  }
-
-  const sideMap = new Map<string, SideSlot[]>();
+  // Step 1: Assign port slots — always exit RIGHT, enter LEFT
+  const srcSlotMap = new Map<string, RoutedArrow[]>();
+  const tgtSlotMap = new Map<string, RoutedArrow[]>();
 
   for (const ra of routed) {
-    const srcKey = `${ra.arrow.from.node.className}::right`;
-    const tgtKey = `${ra.arrow.to.node.className}::left`;
-
-    if (!sideMap.has(srcKey)) sideMap.set(srcKey, []);
-    sideMap.get(srcKey)!.push({ ra, isSource: true, otherBlock: ra.arrow.to });
-
-    if (!sideMap.has(tgtKey)) sideMap.set(tgtKey, []);
-    sideMap.get(tgtKey)!.push({ ra, isSource: false, otherBlock: ra.arrow.from });
+    const sk = ra.arrow.from.node.className;
+    const tk = ra.arrow.to.node.className;
+    if (!srcSlotMap.has(sk)) srcSlotMap.set(sk, []);
+    srcSlotMap.get(sk)!.push(ra);
+    if (!tgtSlotMap.has(tk)) tgtSlotMap.set(tk, []);
+    tgtSlotMap.get(tk)!.push(ra);
   }
 
-  for (const [, slots] of sideMap) {
-    const block = slots[0].isSource ? slots[0].ra.arrow.from : slots[0].ra.arrow.to;
-
-    // Sort by Y position of the other block for vertical ordering
-    slots.sort((a, b) => {
-      const aCy = a.otherBlock.y + a.otherBlock.h / 2;
-      const bCy = b.otherBlock.y + b.otherBlock.h / 2;
-      return aCy - bCy;
-    });
-
-    const count = slots.length;
-    // Use PORT_GAP spacing between connection points, centered on the block
+  // Distribute exit points on right side of source blocks
+  for (const [, ras] of srcSlotMap) {
+    const block = ras[0].arrow.from;
+    ras.sort((a, b) => (a.arrow.to.y + a.arrow.to.h / 2) - (b.arrow.to.y + b.arrow.to.h / 2));
+    const count = ras.length;
     const totalSpan = (count - 1) * PORT_GAP;
     const startY = block.y + (block.h - totalSpan) / 2;
-
     for (let i = 0; i < count; i++) {
-      const py = count === 1 ? block.y + block.h / 2 : startY + i * PORT_GAP;
-      const px = slots[i].isSource ? block.x + block.w : block.x;
-
-      if (slots[i].isSource) {
-        slots[i].ra.srcX = px; slots[i].ra.srcY = py;
-      } else {
-        slots[i].ra.tgtX = px; slots[i].ra.tgtY = py;
-      }
+      ras[i].srcX = block.x + block.w;
+      ras[i].srcY = count === 1 ? block.y + block.h / 2 : startY + i * PORT_GAP;
     }
   }
 
-  // Step 3: Compute collision-aware orthogonal paths
-  for (const ra of routed) computeOrthoPath(ra);
+  // Distribute entry points on left side of target blocks
+  for (const [, ras] of tgtSlotMap) {
+    const block = ras[0].arrow.to;
+    ras.sort((a, b) => (a.arrow.from.y + a.arrow.from.h / 2) - (b.arrow.from.y + b.arrow.from.h / 2));
+    const count = ras.length;
+    const totalSpan = (count - 1) * PORT_GAP;
+    const startY = block.y + (block.h - totalSpan) / 2;
+    for (let i = 0; i < count; i++) {
+      ras[i].tgtX = block.x;
+      ras[i].tgtY = count === 1 ? block.y + block.h / 2 : startY + i * PORT_GAP;
+    }
+  }
 
-  // Step 4: Deconflict parallel vertical and horizontal tracks
+  // Step 2: Route each arrow through channels
+  const obs = drawnBlocks.filter(b => b.stage >= 0); // only leaf blocks are obstacles
+  for (const ra of routed) routeArrow(ra, obs);
+
+  // Step 3: Deconflict parallel tracks
   deconflictTracks(routed);
 
-  // Step 5: Post-route collision check — reroute any segments that strike through blocks
-  for (const ra of routed) fixCollisions(ra);
+  // Step 4: Draw
+  for (const ra of routed) drawArrow(parent, ra);
 
-  // Step 6: Draw arrows
-  for (const ra of routed) drawOrthoArrow(parent, ra);
-
-  // Step 7: Draw multi-connection junction indicators
+  // Step 5: Draw junction indicators for shared ports
   drawJunctions(parent, routed);
 }
 
-// ─── Segment collision helpers ─────────────────────────────────
+function routeArrow(ra: RoutedArrow, obs: BlockRect[]): void {
+  const { srcX: x1, srcY: y1, tgtX: x2, tgtY: y2, arrow } = ra;
 
-type Pt = { x: number; y: number };
+  // Filter out source and target from obstacles
+  const myObs = obs.filter(b =>
+    b.node.className !== arrow.from.node.className &&
+    b.node.className !== arrow.to.node.className
+  );
+
+  if (x2 > x1 + 2) {
+    // Forward: target is to the right
+    ra.waypoints = routeForward(x1, y1, x2, y2, myObs);
+  } else {
+    // Backward: target is to the left — route around via perimeter
+    ra.waypoints = routeBackward(x1, y1, x2, y2, myObs);
+  }
+}
+
+function routeForward(x1: number, y1: number, x2: number, y2: number, obs: BlockRect[]): Pt[] {
+  // Horizontal stub out of source
+  const stubX = x1 + STUB_LEN;
+
+  if (Math.abs(y1 - y2) < 2) {
+    // Same Y: try direct horizontal
+    if (!hSegHitsBlock(x1, x2, y1, obs)) {
+      return [{ x: x1, y: y1 }, { x: x2, y: y2 }];
+    }
+  }
+
+  // Find a clear vertical channel between stub and target
+  const channelX = findClearVChannel(stubX, x2 - STUB_LEN, y1, y2, obs);
+
+  // Check if Z-shape works
+  if (!hSegHitsBlock(x1, channelX, y1, obs) &&
+      !vSegHitsBlock(channelX, y1, y2, obs) &&
+      !hSegHitsBlock(channelX, x2, y2, obs)) {
+    if (Math.abs(y1 - y2) < 2) {
+      return [{ x: x1, y: y1 }, { x: x2, y: y2 }];
+    }
+    return [{ x: x1, y: y1 }, { x: channelX, y: y1 }, { x: channelX, y: y2 }, { x: x2, y: y2 }];
+  }
+
+  // Detour above or below obstacles
+  return routeDetour(x1, y1, x2, y2, obs);
+}
+
+function routeDetour(x1: number, y1: number, x2: number, y2: number, obs: BlockRect[]): Pt[] {
+  const xMin = Math.min(x1, x2), xMax = Math.max(x1, x2);
+  const blockers = obs.filter(b => b.x + b.w > xMin && b.x < xMax);
+
+  if (blockers.length === 0) {
+    const midX = Math.round((x1 + x2) / 2);
+    if (Math.abs(y1 - y2) < 2) return [{ x: x1, y: y1 }, { x: x2, y: y2 }];
+    return [{ x: x1, y: y1 }, { x: midX, y: y1 }, { x: midX, y: y2 }, { x: x2, y: y2 }];
+  }
+
+  const minBY = Math.min(...blockers.map(b => b.y));
+  const maxBY = Math.max(...blockers.map(b => b.y + b.h));
+  const above = minBY - BLOCK_ARROW_GAP * 3;
+  const below = maxBY + BLOCK_ARROW_GAP * 3;
+  const detourY = (Math.abs(y1 - above) + Math.abs(y2 - above) < Math.abs(y1 - below) + Math.abs(y2 - below)) ? above : below;
+
+  const vx1 = x1 + STUB_LEN;
+  const vx2 = x2 - STUB_LEN;
+
+  return [
+    { x: x1, y: y1 }, { x: vx1, y: y1 },
+    { x: vx1, y: detourY }, { x: vx2, y: detourY },
+    { x: vx2, y: y2 }, { x: x2, y: y2 },
+  ];
+}
+
+function routeBackward(x1: number, y1: number, x2: number, y2: number, obs: BlockRect[]): Pt[] {
+  // Route above all blocks via perimeter
+  const allMinY = drawnBlocks.length > 0 ? Math.min(...drawnBlocks.map(b => b.y)) : Math.min(y1, y2);
+  const routeY = Math.round(allMinY - PERIMETER_MARGIN * 2);
+
+  const exitX = x1 + STUB_LEN;
+  const entryX = x2 - STUB_LEN;
+
+  return [
+    { x: x1, y: y1 }, { x: exitX, y: y1 },
+    { x: exitX, y: routeY }, { x: entryX, y: routeY },
+    { x: entryX, y: y2 }, { x: x2, y: y2 },
+  ];
+}
+
+// ─── Segment collision helpers ────────────────────────────────
 
 function hSegHitsBlock(x1: number, x2: number, y: number, obs: BlockRect[]): boolean {
   const xMin = Math.min(x1, x2), xMax = Math.max(x1, x2);
@@ -883,7 +868,6 @@ function findClearVChannel(xL: number, xR: number, y1: number, y2: number, obs: 
   const midX = Math.round((xL + xR) / 2);
   if (!vSegHitsBlock(midX, y1, y2, obs)) return midX;
 
-  // Find gaps between obstacle blocks in the X range
   const yMin = Math.min(y1, y2), yMax = Math.max(y1, y2);
   const inRange = obs.filter(b =>
     b.x + b.w > Math.min(xL, xR) && b.x < Math.max(xL, xR) &&
@@ -891,9 +875,8 @@ function findClearVChannel(xL: number, xR: number, y1: number, y2: number, obs: 
   ).sort((a, b) => a.x - b.x);
 
   const gaps: number[] = [];
-  if (inRange.length > 0 && inRange[0].x > Math.min(xL, xR) + BLOCK_ARROW_GAP * 2) {
+  if (inRange.length > 0 && inRange[0].x > Math.min(xL, xR) + BLOCK_ARROW_GAP * 2)
     gaps.push(Math.round((Math.min(xL, xR) + inRange[0].x) / 2));
-  }
   for (let i = 0; i < inRange.length - 1; i++) {
     const right = inRange[i].x + inRange[i].w;
     const left = inRange[i + 1].x;
@@ -901,9 +884,8 @@ function findClearVChannel(xL: number, xR: number, y1: number, y2: number, obs: 
   }
   if (inRange.length > 0) {
     const last = inRange[inRange.length - 1];
-    if (Math.max(xL, xR) - (last.x + last.w) > BLOCK_ARROW_GAP * 2) {
+    if (Math.max(xL, xR) - (last.x + last.w) > BLOCK_ARROW_GAP * 2)
       gaps.push(Math.round((last.x + last.w + Math.max(xL, xR)) / 2));
-    }
   }
 
   gaps.sort((a, b) => Math.abs(a - midX) - Math.abs(b - midX));
@@ -916,109 +898,11 @@ function findClearVChannel(xL: number, xR: number, y1: number, y2: number, obs: 
   return midX;
 }
 
-// ─── Collision-aware orthogonal path computation ──────────────
-
-function computeOrthoPath(ra: RoutedArrow): void {
-  const { srcX: x1, srcY: y1, tgtX: x2, tgtY: y2, arrow } = ra;
-
-  const obs = drawnBlocks.filter(b =>
-    b.node.className !== arrow.from.node.className &&
-    b.node.className !== arrow.to.node.className
-  );
-
-  // Always right→left. Use routeHorizontal when target is to the right,
-  // routeBackwards when target is to the left (wraps around).
-  if (x2 > x1) {
-    ra.waypoints = routeHorizontal(x1, y1, x2, y2, obs);
-  } else {
-    ra.waypoints = routeBackwards(x1, y1, x2, y2, obs);
-  }
-}
-
-function routeHorizontal(x1: number, y1: number, x2: number, y2: number, obs: BlockRect[]): Pt[] {
-  // Same Y: try straight line first
-  if (Math.abs(y1 - y2) < 2) {
-    if (!hSegHitsBlock(x1, x2, y1, obs)) {
-      return [{ x: x1, y: y1 }, { x: x2, y: y2 }];
-    }
-    return routeDetour(x1, y1, x2, y2, obs);
-  }
-
-  // Different Y: Z-shape with a clear vertical channel
-  const midX = findClearVChannel(x1, x2, y1, y2, obs);
-  if (!hSegHitsBlock(x1, midX, y1, obs) && !hSegHitsBlock(midX, x2, y2, obs)) {
-    return [
-      { x: x1, y: y1 }, { x: midX, y: y1 },
-      { x: midX, y: y2 }, { x: x2, y: y2 },
-    ];
-  }
-  return routeDetour(x1, y1, x2, y2, obs);
-}
-
-function routeDetour(x1: number, y1: number, x2: number, y2: number, obs: BlockRect[]): Pt[] {
-  const xMin = Math.min(x1, x2), xMax = Math.max(x1, x2);
-  const blockers = obs.filter(b => b.x + b.w > xMin && b.x < xMax);
-  if (blockers.length === 0) {
-    const midX = Math.round((x1 + x2) / 2);
-    if (Math.abs(y1 - y2) < 2) return [{ x: x1, y: y1 }, { x: x2, y: y2 }];
-    return [{ x: x1, y: y1 }, { x: midX, y: y1 }, { x: midX, y: y2 }, { x: x2, y: y2 }];
-  }
-
-  const minBY = Math.min(...blockers.map(b => b.y));
-  const maxBY = Math.max(...blockers.map(b => b.y + b.h));
-  let above = minBY - 30, below = maxBY + 30;
-  // Clamp within container bounds
-  if (containerBounds) {
-    above = Math.max(above, containerBounds.y + HEADER_H + 6);
-    below = Math.min(below, containerBounds.y + containerBounds.h - 6);
-  }
-  const detourY = (Math.abs(y1 - above) + Math.abs(y2 - above) <
-                   Math.abs(y1 - below) + Math.abs(y2 - below)) ? above : below;
-
-  const vx1N = x1 + 12;
-  const vx2N = x2 - 12;
-  const vx1 = vSegHitsBlock(vx1N, y1, detourY, obs)
-    ? findClearVChannel(x1, (x1 + x2) / 2, y1, detourY, obs) : vx1N;
-  const vx2 = vSegHitsBlock(vx2N, y2, detourY, obs)
-    ? findClearVChannel((x1 + x2) / 2, x2, y2, detourY, obs) : vx2N;
-
-  return [
-    { x: x1, y: y1 }, { x: vx1, y: y1 },
-    { x: vx1, y: detourY }, { x: vx2, y: detourY },
-    { x: vx2, y: y2 }, { x: x2, y: y2 },
-  ];
-}
-
-function routeBackwards(x1: number, y1: number, x2: number, y2: number, obs: BlockRect[]): Pt[] {
-  const allMinY = drawnBlocks.length > 0
-    ? Math.min(...drawnBlocks.map(b => b.y), y1, y2) : Math.min(y1, y2);
-  let routeY = Math.round(allMinY - 30);
-  // Clamp within container bounds
-  if (containerBounds) {
-    routeY = Math.max(routeY, containerBounds.y + HEADER_H + 6);
-  }
-  const exitX = Math.round(x1 - 15);
-  const entryX = Math.round(x2 + 15);
-
-  // Find clear vertical channels for the exit and entry
-  const vx1 = vSegHitsBlock(exitX, y1, routeY, obs)
-    ? findClearVChannel(x1 - 40, x1, y1, routeY, obs) : exitX;
-  const vx2 = vSegHitsBlock(entryX, y2, routeY, obs)
-    ? findClearVChannel(x2, x2 + 40, y2, routeY, obs) : entryX;
-
-  return [
-    { x: x1, y: y1 }, { x: vx1, y: y1 },
-    { x: vx1, y: routeY }, { x: vx2, y: routeY },
-    { x: vx2, y: y2 }, { x: x2, y: y2 },
-  ];
-}
-
 // ─── Track deconfliction ──────────────────────────────────────
 
 interface SegInfo { routeIdx: number; segIdx: number; pos: number; min: number; max: number }
 
 function deconflictTracks(routed: RoutedArrow[]): void {
-  // Collect ALL vertical segments across all paths
   const vSegs: SegInfo[] = [];
   const hSegs: SegInfo[] = [];
   for (let ri = 0; ri < routed.length; ri++) {
@@ -1026,16 +910,12 @@ function deconflictTracks(routed: RoutedArrow[]): void {
     for (let si = 0; si < pts.length - 1; si++) {
       const dx = Math.abs(pts[si].x - pts[si + 1].x);
       const dy = Math.abs(pts[si].y - pts[si + 1].y);
-      if (dx < 1 && dy > 4) {
-        vSegs.push({ routeIdx: ri, segIdx: si, pos: pts[si].x,
-          min: Math.min(pts[si].y, pts[si + 1].y), max: Math.max(pts[si].y, pts[si + 1].y) });
-      } else if (dy < 1 && dx > 4) {
-        hSegs.push({ routeIdx: ri, segIdx: si, pos: pts[si].y,
-          min: Math.min(pts[si].x, pts[si + 1].x), max: Math.max(pts[si].x, pts[si + 1].x) });
-      }
+      if (dx < 1 && dy > 4)
+        vSegs.push({ routeIdx: ri, segIdx: si, pos: pts[si].x, min: Math.min(pts[si].y, pts[si + 1].y), max: Math.max(pts[si].y, pts[si + 1].y) });
+      else if (dy < 1 && dx > 4)
+        hSegs.push({ routeIdx: ri, segIdx: si, pos: pts[si].y, min: Math.min(pts[si].x, pts[si + 1].x), max: Math.max(pts[si].x, pts[si + 1].x) });
     }
   }
-
   spreadOverlapping(vSegs, routed, 'v');
   spreadOverlapping(hSegs, routed, 'h');
 }
@@ -1065,173 +945,40 @@ function spreadOverlapping(segs: SegInfo[], routed: RoutedArrow[], axis: 'v' | '
   }
 }
 
-// ─── Post-route collision fix ──────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+// ═ PHASE 3: DRAWING
+// ═══════════════════════════════════════════════════════════════
 
-function fixCollisions(ra: RoutedArrow): void {
-  const pts = ra.waypoints;
-  if (pts.length < 2) return;
-  const obs = drawnBlocks.filter(b =>
-    b.node.className !== ra.arrow.from.node.className &&
-    b.node.className !== ra.arrow.to.node.className
-  );
-
-  // Check each segment and reroute if it hits a block
-  let changed = true;
-  let passes = 0;
-  while (changed && passes < 5) {
-    changed = false;
-    passes++;
-    for (let i = 0; i < pts.length - 1; i++) {
-      const p1 = pts[i], p2 = pts[i + 1];
-      const isH = Math.abs(p1.y - p2.y) < 1;
-      const isV = Math.abs(p1.x - p2.x) < 1;
-
-      if (isH && hSegHitsBlock(p1.x, p2.x, p1.y, obs)) {
-        // Horizontal segment hits a block — find a clear Y and reroute with a detour
-        const xMin = Math.min(p1.x, p2.x), xMax = Math.max(p1.x, p2.x);
-        const blockers = obs.filter(b =>
-          b.x + b.w > xMin + 2 && b.x < xMax - 2 &&
-          p1.y > b.y - BLOCK_ARROW_GAP && p1.y < b.y + b.h + BLOCK_ARROW_GAP
-        );
-        if (blockers.length > 0) {
-          const above = Math.min(...blockers.map(b => b.y)) - BLOCK_ARROW_GAP;
-          const below = Math.max(...blockers.map(b => b.y + b.h)) + BLOCK_ARROW_GAP;
-          const detourY = Math.abs(p1.y - above) < Math.abs(p1.y - below) ? above : below;
-          // Replace segment with 3-segment detour: down/up, across, up/down
-          const midX1 = p1.x + (p2.x > p1.x ? TRACK_SPACING : -TRACK_SPACING);
-          const midX2 = p2.x + (p2.x > p1.x ? -TRACK_SPACING : TRACK_SPACING);
-          pts.splice(i + 1, 0,
-            { x: midX1, y: p1.y }, { x: midX1, y: detourY },
-            { x: midX2, y: detourY }, { x: midX2, y: p2.y }
-          );
-          changed = true;
-          break;
-        }
-      } else if (isV && vSegHitsBlock(p1.x, p1.y, p2.y, obs)) {
-        // Vertical segment hits a block — find a clear X and reroute
-        const yMin = Math.min(p1.y, p2.y), yMax = Math.max(p1.y, p2.y);
-        const blockers = obs.filter(b =>
-          p1.x > b.x - BLOCK_ARROW_GAP && p1.x < b.x + b.w + BLOCK_ARROW_GAP &&
-          yMax > b.y + 2 && yMin < b.y + b.h - 2
-        );
-        if (blockers.length > 0) {
-          const clearX = findClearVChannel(
-            Math.min(p1.x, p2.x) - 60, Math.max(p1.x, p2.x) + 60,
-            p1.y, p2.y, obs
-          );
-          const midY1 = p1.y + (p2.y > p1.y ? TRACK_SPACING : -TRACK_SPACING);
-          const midY2 = p2.y + (p2.y > p1.y ? -TRACK_SPACING : TRACK_SPACING);
-          pts.splice(i + 1, 0,
-            { x: p1.x, y: midY1 }, { x: clearX, y: midY1 },
-            { x: clearX, y: midY2 }, { x: p2.x, y: midY2 }
-          );
-          changed = true;
-          break;
-        }
-      }
-    }
-  }
-}
-
-// ─── Multi-connection junction indicators ──────────────────────
-
-function drawJunctions(parent: SVGGElement, routed: RoutedArrow[]): void {
-  // Find connection points where multiple arrows share the same origin/destination point
-  const pointMap = new Map<string, { x: number; y: number; color: string; count: number }>();
-
-  for (const ra of routed) {
-    const pts = ra.waypoints;
-    if (pts.length < 2) continue;
-
-    // Source point
-    const sk = `${Math.round(pts[0].x)},${Math.round(pts[0].y)}`;
-    if (pointMap.has(sk)) {
-      pointMap.get(sk)!.count++;
-    } else {
-      pointMap.set(sk, { x: pts[0].x, y: pts[0].y, color: ra.arrow.color, count: 1 });
-    }
-
-    // Target point
-    const tk = `${Math.round(pts[pts.length - 1].x)},${Math.round(pts[pts.length - 1].y)}`;
-    if (pointMap.has(tk)) {
-      pointMap.get(tk)!.count++;
-    } else {
-      pointMap.set(tk, { x: pts[pts.length - 1].x, y: pts[pts.length - 1].y, color: ra.arrow.color, count: 1 });
-    }
-  }
-
-  // Draw bus-junction indicator for points with multiple connections
-  for (const [, pt] of pointMap) {
-    if (pt.count <= 1) continue;
-    // Draw a rounded rectangle (bus bar) at the junction
-    const jw = 8, jh = Math.min(pt.count * PORT_GAP, 30);
-    parent.appendChild(attrs(el('rect'), {
-      x: pt.x - jw / 2, y: pt.y - jh / 2, width: jw, height: jh,
-      rx: jw / 2, fill: pt.color, opacity: 0.5, class: 'df-port-dot',
-    }));
-  }
-}
-
-// ─── Orthogonal arrow drawing with port shapes ────────────────
-
-function enforceOrthogonal(pts: Pt[]): void {
-  // Snap each segment to be strictly horizontal or vertical
-  for (let i = 1; i < pts.length; i++) {
-    const dx = Math.abs(pts[i].x - pts[i - 1].x);
-    const dy = Math.abs(pts[i].y - pts[i - 1].y);
-    if (dx < dy) {
-      // Mostly vertical — snap X to match previous point
-      pts[i].x = pts[i - 1].x;
-    } else {
-      // Mostly horizontal — snap Y to match previous point
-      pts[i].y = pts[i - 1].y;
-    }
-  }
-}
-
-function drawOrthoArrow(parent: SVGGElement, ra: RoutedArrow): void {
+function drawArrow(parent: SVGGElement, ra: RoutedArrow): void {
   const { arrow: a, waypoints: pts } = ra;
   if (pts.length < 2) return;
 
-  // Enforce strict orthogonality — no diagonals allowed
-  enforceOrthogonal(pts);
+  // Enforce strict orthogonality
+  for (let i = 1; i < pts.length; i++) {
+    const dx = Math.abs(pts[i].x - pts[i - 1].x);
+    const dy = Math.abs(pts[i].y - pts[i - 1].y);
+    if (dx < dy) pts[i].x = pts[i - 1].x;
+    else pts[i].y = pts[i - 1].y;
+  }
 
-  // Ensure the last segment is long enough for the arrowhead to be visible.
-  const MIN_LAST_SEG = 14;
+  // Ensure last segment is long enough for arrowhead
   if (pts.length >= 3) {
-    const last = pts[pts.length - 1];
-    const prev = pts[pts.length - 2];
+    const last = pts[pts.length - 1], prev = pts[pts.length - 2];
     const dx = last.x - prev.x, dy = last.y - prev.y;
-    const segLen = Math.abs(dx) + Math.abs(dy); // Manhattan distance (one axis is 0)
-    if (segLen > 0 && segLen < MIN_LAST_SEG) {
-      // Extend along the axis of the last segment only
-      if (Math.abs(dx) > Math.abs(dy)) {
-        // Horizontal last segment — extend X
-        pts[pts.length - 2].x = last.x - Math.sign(dx) * MIN_LAST_SEG;
-      } else {
-        // Vertical last segment — extend Y
-        pts[pts.length - 2].y = last.y - Math.sign(dy) * MIN_LAST_SEG;
-      }
+    const segLen = Math.abs(dx) + Math.abs(dy);
+    if (segLen > 0 && segLen < 14) {
+      if (Math.abs(dx) > Math.abs(dy)) prev.x = last.x - Math.sign(dx) * 14;
+      else prev.y = last.y - Math.sign(dy) * 14;
     }
   }
 
-  // Port circle at source (connection point on block border)
-  parent.appendChild(attrs(el('circle'), {
-    cx: pts[0].x, cy: pts[0].y, r: PORT_CIRCLE_R,
-    fill: a.color, stroke: '#1e1e1e', 'stroke-width': 1, class: 'df-port-dot',
-  }));
+  // Port circles
+  parent.appendChild(attrs(el('circle'), { cx: pts[0].x, cy: pts[0].y, r: PORT_CIRCLE_R, fill: a.color, stroke: '#1e1e1e', 'stroke-width': 1, class: 'df-port-dot' }));
+  parent.appendChild(attrs(el('circle'), { cx: pts[pts.length - 1].x, cy: pts[pts.length - 1].y, r: PORT_CIRCLE_R, fill: a.color, stroke: '#1e1e1e', 'stroke-width': 1, class: 'df-port-dot' }));
 
-  // Port circle at target
-  parent.appendChild(attrs(el('circle'), {
-    cx: pts[pts.length - 1].x, cy: pts[pts.length - 1].y, r: PORT_CIRCLE_R,
-    fill: a.color, stroke: '#1e1e1e', 'stroke-width': 1, class: 'df-port-dot',
-  }));
-
-  // Build SVG path — strictly orthogonal, no curves
+  // Build strictly-orthogonal SVG path (M + L only)
   let d = `M${pts[0].x},${pts[0].y}`;
-  for (let i = 1; i < pts.length; i++) {
-    d += ` L${pts[i].x},${pts[i].y}`;
-  }
+  for (let i = 1; i < pts.length; i++) d += ` L${pts[i].x},${pts[i].y}`;
 
   const arrowPath = attrs(el('path'), {
     d, class: 'df-arrow',
@@ -1240,17 +987,13 @@ function drawOrthoArrow(parent: SVGGElement, ra: RoutedArrow): void {
     'marker-end': `url(#${a.marker})`,
   });
 
-  // Click-to-navigate: open the source file at the line of the .connect() call
   if (a.filePath && a.line) {
     arrowPath.style.cursor = 'pointer';
     const title = el('title') as SVGTitleElement;
     title.textContent = `Click to open connection (line ${a.line})`;
     arrowPath.appendChild(title);
-    arrowPath.addEventListener('click', () => {
-      vscode.postMessage({ command: 'openFile', filePath: a.filePath, line: a.line });
-    });
+    arrowPath.addEventListener('click', () => { vscode.postMessage({ command: 'openFile', filePath: a.filePath, line: a.line }); });
   }
-
   parent.appendChild(arrowPath);
 
   // Label on longest segment
@@ -1259,109 +1002,39 @@ function drawOrthoArrow(parent: SVGGElement, ra: RoutedArrow): void {
     for (let i = 0; i < pts.length - 1; i++) {
       const dx = pts[i + 1].x - pts[i].x, dy = pts[i + 1].y - pts[i].y;
       const len = Math.abs(dx) + Math.abs(dy);
-      if (len > bestLen) {
-        bestLen = len;
-        bestMx = (pts[i].x + pts[i + 1].x) / 2;
-        bestMy = (pts[i].y + pts[i + 1].y) / 2;
-        isVert = Math.abs(dy) > Math.abs(dx);
-      }
+      if (len > bestLen) { bestLen = len; bestMx = (pts[i].x + pts[i + 1].x) / 2; bestMy = (pts[i].y + pts[i + 1].y) / 2; isVert = Math.abs(dy) > Math.abs(dx); }
     }
     const displayLabel = a.label.length > 20 ? a.label.slice(0, 18) + '..' : a.label;
     const tw = displayLabel.length * 5 + 10;
     const lx = isVert ? bestMx + 6 : bestMx;
     const ly = isVert ? bestMy : bestMy - 12;
-
-    parent.appendChild(attrs(el('rect'), {
-      x: lx - tw / 2, y: ly - 7, width: tw, height: 14,
-      rx: 3, fill: '#111', opacity: 0.92, stroke: a.color, 'stroke-width': 0.5,
-    }));
-    const lbl = attrs(el('text'), {
-      x: lx, y: ly + 3, 'text-anchor': 'middle',
-      'font-size': 8, fill: a.color, class: 'df-arrow-label',
-    }) as SVGTextElement;
+    parent.appendChild(attrs(el('rect'), { x: lx - tw / 2, y: ly - 7, width: tw, height: 14, rx: 3, fill: '#111', opacity: 0.92, stroke: a.color, 'stroke-width': 0.5 }));
+    const lbl = attrs(el('text'), { x: lx, y: ly + 3, 'text-anchor': 'middle', 'font-size': 8, fill: a.color, class: 'df-arrow-label' }) as SVGTextElement;
     lbl.textContent = displayLabel;
     parent.appendChild(lbl);
   }
 }
 
-function nearest(block: BlockRect, targets: BlockRect[]): BlockRect {
-  let best = targets[0]; let minD = Infinity;
-  const cx = block.x + block.w / 2, cy = block.y + block.h / 2;
-  for (const t of targets) {
-    const d = (t.x + t.w / 2 - cx) ** 2 + (t.y + t.h / 2 - cy) ** 2;
-    if (d < minD) { minD = d; best = t; }
-  }
-  return best;
-}
-
-// ─── Absolute position helper ─────────────────────────────────
-function absPos(e: SVGElement): { x: number; y: number } {
-  let x = 0, y = 0;
-  let cur: SVGElement | null = e;
-  while (cur && cur !== rootG) {
-    const t = cur.getAttribute('transform');
-    if (t) {
-      const m = t.match(/translate\(([\d.-]+),([\d.-]+)\)/);
-      if (m) { x += parseFloat(m[1]); y += parseFloat(m[2]); }
+function drawJunctions(parent: SVGGElement, routed: RoutedArrow[]): void {
+  // Find connection points where multiple arrows share the same exit/entry
+  const pointMap = new Map<string, { x: number; y: number; color: string; count: number }>();
+  for (const ra of routed) {
+    const pts = ra.waypoints;
+    if (pts.length < 2) continue;
+    for (const pt of [pts[0], pts[pts.length - 1]]) {
+      const k = `${Math.round(pt.x)},${Math.round(pt.y)}`;
+      if (pointMap.has(k)) pointMap.get(k)!.count++;
+      else pointMap.set(k, { x: pt.x, y: pt.y, color: ra.arrow.color, count: 1 });
     }
-    cur = cur.parentElement as SVGElement | null;
   }
-  return { x, y };
-}
-
-// ─── TLM port indicators (positioned by data direction) ──────
-function isOutputPort(kind: string): boolean {
-  return kind.includes('analysis_port') || kind.includes('put_port') || kind.includes('seq_item_port');
-}
-
-function drawPorts(g: SVGGElement, node: UvmDiagramNode, w: number, h: number, theme: Theme): void {
-  if (node.tlmPorts.length === 0) return;
-
-  // Separate into output (right) and input (left) ports
-  const rightPorts = node.tlmPorts.filter(p => isOutputPort(p.kind));
-  const leftPorts = node.tlmPorts.filter(p => !isOutputPort(p.kind));
-
-  const drawSidePorts = (ports: TlmPort[], side: 'left' | 'right') => {
-    if (ports.length === 0) return;
-    const x = side === 'right' ? w : 0;
-    const totalH = ports.length * PORT_GAP;
-    let py = (h - totalH) / 2 + PORT_GAP / 2;
-    const anchor = side === 'right' ? 'start' : 'end';
-    const lblX = side === 'right' ? x + PORT_R + 4 : x - PORT_R - 4;
-
-    for (const port of ports) {
-      const isExp = port.kind.includes('export') || port.kind.includes('imp');
-      const title = el('title') as SVGTitleElement;
-      title.textContent = `${port.fieldName}: ${port.kind} #(${port.paramType})`;
-
-      if (isExp) {
-        const sq = attrs(el('rect'), {
-          x: x - PORT_R, y: py - PORT_R, width: PORT_R * 2, height: PORT_R * 2,
-          rx: 1, fill: theme.accent, stroke: '#fff', 'stroke-width': 0.8,
-        });
-        sq.appendChild(title);
-        g.appendChild(sq);
-      } else {
-        const c = attrs(el('circle'), {
-          cx: x, cy: py, r: PORT_R,
-          fill: theme.accent, stroke: '#fff', 'stroke-width': 0.8,
-        });
-        c.appendChild(title);
-        g.appendChild(c);
-      }
-
-      const lbl = attrs(el('text'), {
-        x: lblX, y: py + 3, 'text-anchor': anchor,
-        'font-size': 7, fill: '#999', class: 'df-port-label',
-      }) as SVGTextElement;
-      lbl.textContent = port.fieldName.length > 10 ? port.fieldName.slice(0, 9) + '..' : port.fieldName;
-      g.appendChild(lbl);
-      py += PORT_GAP;
-    }
-  };
-
-  drawSidePorts(leftPorts, 'left');
-  drawSidePorts(rightPorts, 'right');
+  for (const [, pt] of pointMap) {
+    if (pt.count <= 1) continue;
+    const jw = 8, jh = Math.min(pt.count * 8, 24);
+    parent.appendChild(attrs(el('rect'), {
+      x: pt.x - jw / 2, y: pt.y - jh / 2, width: jw, height: jh,
+      rx: jw / 2, fill: pt.color, opacity: 0.5, class: 'df-port-dot',
+    }));
+  }
 }
 
 // ─── Symbolic icons ───────────────────────────────────────────
@@ -1446,43 +1119,29 @@ function drawIcon(g: SVGGElement, type: string, w: number, color: string): void 
   g.appendChild(ig);
 }
 
-// ─── Legend icon SVG helper ─────────────────────────────────────
+// ─── Legend ───────────────────────────────────────────────────
 function legendIconHtml(type: string): string {
   const c = THEMES[type]?.stroke || '#888';
   const s = `stroke="${c}" fill="none" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"`;
   switch (type) {
-    case 'test':
-      return `<svg width="14" height="14" viewBox="0 0 14 14"><path ${s} d="M5,1 h4 M6,1 v3.5 L3,10.5 a1.5,1.5,0,0,0,1.3,2.2 h5.4 a1.5,1.5,0,0,0,1.3-2.2 L8,4.5 v-3.5"/><polyline ${s} points="5.5,10 6.5,11 8.5,9"/></svg>`;
-    case 'env':
-      return `<svg width="14" height="14" viewBox="0 0 14 14"><path ${s} d="M7,13 v-5 Q7,3 12,2 Q11,8 7,8"/><path ${s} d="M7,10 Q3,4 2,2 Q7,3 7,8"/></svg>`;
-    case 'agent':
-      return `<svg width="14" height="14" viewBox="0 0 14 14"><rect ${s} x="1.5" y="5" width="11" height="8" rx="1.5"/><path ${s} d="M5,5 v-2 a1,1,0,0,1,1-1 h2 a1,1,0,0,1,1,1 v2"/><line ${s} x1="1.5" y1="9" x2="12.5" y2="9"/></svg>`;
-    case 'driver':
-      return `<svg width="14" height="14" viewBox="0 0 14 14"><path ${s} d="M2,4 h6 l-2,-2.5 M8,4 l-2,2.5"/><path ${s} d="M2,10 h6 l-2,-2.5 M8,10 l-2,2.5"/><line stroke="${c}" stroke-width="1.5" stroke-linecap="round" x1="10" y1="2" x2="10" y2="12"/></svg>`;
-    case 'monitor':
-      return `<svg width="14" height="14" viewBox="0 0 14 14"><rect ${s} x="1.5" y="1.5" width="11" height="8" rx="1.5"/><line ${s} x1="7" y1="9.5" x2="7" y2="12"/><line ${s} x1="4" y1="12" x2="10" y2="12"/><polyline ${s} points="3.5,5.5 5,3.5 6.5,7 8,4 9.5,6.5 11,4.5"/></svg>`;
-    case 'sequencer':
-      return `<svg width="14" height="14" viewBox="0 0 14 14"><polyline ${s} points="4,2 7,5 10,2"/><polyline ${s} points="4,5.5 7,8.5 10,5.5"/><polyline ${s} points="4,9 7,12 10,9"/></svg>`;
-    case 'scoreboard':
-      return `<svg width="14" height="14" viewBox="0 0 14 14"><line ${s} x1="7" y1="1.5" x2="7" y2="10"/><line ${s} x1="3" y1="3.5" x2="11" y2="3.5"/><path ${s} d="M3,3.5 L1.5,7.5 h3 z"/><path ${s} d="M11,3.5 L9.5,7.5 h3 z"/><polygon points="5,12 9,12 7,10" stroke="${c}" fill="${c}" opacity="0.3" stroke-width="1.2"/></svg>`;
-    case 'sequence':
-      return `<svg width="14" height="14" viewBox="0 0 14 14"><rect ${s} x="3" y="1" width="9" height="6" rx="1"/><rect ${s} x="1.5" y="3.5" width="9" height="6" rx="1"/><rect ${s} x="0" y="6" width="9" height="6" rx="1"/></svg>`;
-    case 'component':
-      return `<svg width="14" height="14" viewBox="0 0 14 14"><rect ${s} x="3.5" y="2" width="7" height="10" rx="1"/><line ${s} x1="1" y1="5" x2="3.5" y2="5"/><line ${s} x1="1" y1="9" x2="3.5" y2="9"/><line ${s} x1="10.5" y1="5" x2="13" y2="5"/><line ${s} x1="10.5" y1="9" x2="13" y2="9"/></svg>`;
-    case 'dut':
-      return `<svg width="14" height="14" viewBox="0 0 14 14"><rect ${s} x="3" y="2" width="8" height="10" rx="1"/><line ${s} x1="0" y1="4" x2="3" y2="4"/><line ${s} x1="0" y1="7" x2="3" y2="7"/><line ${s} x1="0" y1="10" x2="3" y2="10"/><line ${s} x1="11" y1="4" x2="14" y2="4"/><line ${s} x1="11" y1="7" x2="14" y2="7"/><line ${s} x1="11" y1="10" x2="14" y2="10"/><line ${s} x1="5" y1="0" x2="5" y2="2"/><line ${s} x1="9" y1="0" x2="9" y2="2"/></svg>`;
-    case 'object':
-      return `<svg width="14" height="14" viewBox="0 0 14 14"><path ${s} d="M2,1.5 h6.5 l3,3 v8 a1,1,0,0,1-1,1 h-8.5 a1,1,0,0,1-1-1 v-10 a1,1,0,0,1,1-1 z"/><path ${s} d="M8.5,1.5 v3 h3"/></svg>`;
-    default:
-      return `<svg width="14" height="14" viewBox="0 0 14 14"><rect ${s} x="2" y="2" width="10" height="10" rx="2"/></svg>`;
+    case 'test': return `<svg width="14" height="14" viewBox="0 0 14 14"><path ${s} d="M5,1 h4 M6,1 v3.5 L3,10.5 a1.5,1.5,0,0,0,1.3,2.2 h5.4 a1.5,1.5,0,0,0,1.3-2.2 L8,4.5 v-3.5"/><polyline ${s} points="5.5,10 6.5,11 8.5,9"/></svg>`;
+    case 'env': return `<svg width="14" height="14" viewBox="0 0 14 14"><path ${s} d="M7,13 v-5 Q7,3 12,2 Q11,8 7,8"/><path ${s} d="M7,10 Q3,4 2,2 Q7,3 7,8"/></svg>`;
+    case 'agent': return `<svg width="14" height="14" viewBox="0 0 14 14"><rect ${s} x="1.5" y="5" width="11" height="8" rx="1.5"/><path ${s} d="M5,5 v-2 a1,1,0,0,1,1-1 h2 a1,1,0,0,1,1,1 v2"/><line ${s} x1="1.5" y1="9" x2="12.5" y2="9"/></svg>`;
+    case 'driver': return `<svg width="14" height="14" viewBox="0 0 14 14"><path ${s} d="M2,4 h6 l-2,-2.5 M8,4 l-2,2.5"/><path ${s} d="M2,10 h6 l-2,-2.5 M8,10 l-2,2.5"/><line stroke="${c}" stroke-width="1.5" stroke-linecap="round" x1="10" y1="2" x2="10" y2="12"/></svg>`;
+    case 'monitor': return `<svg width="14" height="14" viewBox="0 0 14 14"><rect ${s} x="1.5" y="1.5" width="11" height="8" rx="1.5"/><line ${s} x1="7" y1="9.5" x2="7" y2="12"/><line ${s} x1="4" y1="12" x2="10" y2="12"/><polyline ${s} points="3.5,5.5 5,3.5 6.5,7 8,4 9.5,6.5 11,4.5"/></svg>`;
+    case 'sequencer': return `<svg width="14" height="14" viewBox="0 0 14 14"><polyline ${s} points="4,2 7,5 10,2"/><polyline ${s} points="4,5.5 7,8.5 10,5.5"/><polyline ${s} points="4,9 7,12 10,9"/></svg>`;
+    case 'scoreboard': return `<svg width="14" height="14" viewBox="0 0 14 14"><line ${s} x1="7" y1="1.5" x2="7" y2="10"/><line ${s} x1="3" y1="3.5" x2="11" y2="3.5"/><path ${s} d="M3,3.5 L1.5,7.5 h3 z"/><path ${s} d="M11,3.5 L9.5,7.5 h3 z"/><polygon points="5,12 9,12 7,10" stroke="${c}" fill="${c}" opacity="0.3" stroke-width="1.2"/></svg>`;
+    case 'sequence': return `<svg width="14" height="14" viewBox="0 0 14 14"><rect ${s} x="3" y="1" width="9" height="6" rx="1"/><rect ${s} x="1.5" y="3.5" width="9" height="6" rx="1"/><rect ${s} x="0" y="6" width="9" height="6" rx="1"/></svg>`;
+    case 'component': return `<svg width="14" height="14" viewBox="0 0 14 14"><rect ${s} x="3.5" y="2" width="7" height="10" rx="1"/><line ${s} x1="1" y1="5" x2="3.5" y2="5"/><line ${s} x1="1" y1="9" x2="3.5" y2="9"/><line ${s} x1="10.5" y1="5" x2="13" y2="5"/><line ${s} x1="10.5" y1="9" x2="13" y2="9"/></svg>`;
+    case 'dut': return `<svg width="14" height="14" viewBox="0 0 14 14"><rect ${s} x="3" y="2" width="8" height="10" rx="1"/><line ${s} x1="0" y1="4" x2="3" y2="4"/><line ${s} x1="0" y1="7" x2="3" y2="7"/><line ${s} x1="0" y1="10" x2="3" y2="10"/><line ${s} x1="11" y1="4" x2="14" y2="4"/><line ${s} x1="11" y1="7" x2="14" y2="7"/><line ${s} x1="11" y1="10" x2="14" y2="10"/><line ${s} x1="5" y1="0" x2="5" y2="2"/><line ${s} x1="9" y1="0" x2="9" y2="2"/></svg>`;
+    case 'object': return `<svg width="14" height="14" viewBox="0 0 14 14"><path ${s} d="M2,1.5 h6.5 l3,3 v8 a1,1,0,0,1-1,1 h-8.5 a1,1,0,0,1-1-1 v-10 a1,1,0,0,1,1-1 z"/><path ${s} d="M8.5,1.5 v3 h3"/></svg>`;
+    default: return `<svg width="14" height="14" viewBox="0 0 14 14"><rect ${s} x="2" y="2" width="10" height="10" rx="2"/></svg>`;
   }
 }
 
-// ─── Legend (HTML overlay — never overlaps diagram) ────────────
 function drawLegendOverlay(): void {
   const container = document.getElementById('legend-overlay');
   if (!container) return;
-
   const types = Object.keys(THEMES).filter(k => k !== 'unknown');
   const connTypes = [
     { label: 'TLM Connection', color: '#8888cc', dashed: false },
@@ -1490,32 +1149,17 @@ function drawLegendOverlay(): void {
     { label: 'Virtual Interface', color: '#e6b422', dashed: true },
     { label: 'Analysis Port', color: '#d16969', dashed: false },
   ];
-
   let html = '<div class="legend-title">Legend</div>';
-
   for (const t of types) {
     const th = THEMES[t];
-    html += `<div class="legend-item">
-      <span class="legend-swatch" style="background:${th.fill};border:1.5px solid ${th.stroke};"></span>
-      <span class="legend-icon-svg">${legendIconHtml(t)}</span>
-      <span>${t}</span>
-    </div>`;
+    html += `<div class="legend-item"><span class="legend-swatch" style="background:${th.fill};border:1.5px solid ${th.stroke};"></span><span class="legend-icon-svg">${legendIconHtml(t)}</span><span>${t}</span></div>`;
   }
-
   html += '<div class="legend-section-title">Connections</div>';
-
   for (const c of connTypes) {
     const dashAttr = c.dashed ? ' stroke-dasharray="4,2"' : '';
-    const arrowSvg = `<svg width="30" height="14" viewBox="0 0 30 14" style="vertical-align:middle;">` +
-      `<line x1="0" y1="7" x2="22" y2="7" stroke="${c.color}" stroke-width="2"${dashAttr}/>` +
-      `<path d="M19,3 L26,7 L19,11" fill="${c.color}" stroke="none"/>` +
-      `</svg>`;
-    html += `<div class="legend-item">
-      <span class="legend-conn-svg">${arrowSvg}</span>
-      <span>${c.label}</span>
-    </div>`;
+    const arrowSvg = `<svg width="30" height="14" viewBox="0 0 30 14" style="vertical-align:middle;"><line x1="0" y1="7" x2="22" y2="7" stroke="${c.color}" stroke-width="2"${dashAttr}/><path d="M19,3 L26,7 L19,11" fill="${c.color}" stroke="none"/></svg>`;
+    html += `<div class="legend-item"><span class="legend-conn-svg">${arrowSvg}</span><span>${c.label}</span></div>`;
   }
-
   container.innerHTML = html;
 }
 
