@@ -57,7 +57,7 @@ const CHAR_W = 7.5;
 const DUT_W = 140;
 const DUT_H = 80;
 const TRACK_SPACING = 12;
-const BLOCK_ARROW_GAP = 8;
+const BLOCK_ARROW_GAP = 14;
 const PORT_CIRCLE_R = 3.5;
 const PORT_MARGIN = 14;
 const CHILD_GAP = 20;
@@ -291,6 +291,14 @@ interface AgentGroup {
   members: UvmDiagramNode[];
 }
 
+// Split agent members into rows: sequencer+driver horizontal, monitor below
+function agentRows(members: UvmDiagramNode[]): { row1: UvmDiagramNode[]; row2: UvmDiagramNode[] } {
+  const seqDrv = members.filter(m => m.uvmType === 'sequencer' || m.uvmType === 'driver');
+  const other = members.filter(m => m.uvmType !== 'sequencer' && m.uvmType !== 'driver');
+  if (seqDrv.length === 0) return { row1: members, row2: [] };
+  return { row1: seqDrv, row2: other };
+}
+
 function renderProject(roots: UvmDiagramNode[], duts: DutInfo[]): void {
   const empty = document.getElementById('empty-state')!;
   const ctr = document.getElementById('diagram-container')!;
@@ -336,6 +344,14 @@ function renderProject(roots: UvmDiagramNode[], duts: DutInfo[]): void {
   }
   for (const g of agentGroups) g.members.sort((a, b) => (STAGE[a.uvmType] ?? 99) - (STAGE[b.uvmType] ?? 99));
 
+  // Filter out type-override classes — subclasses of components already in agents
+  const agentMemberClasses = new Set<string>();
+  for (const g of agentGroups) for (const m of g.members) agentMemberClasses.add(m.className);
+  for (let i = standaloneLeaves.length - 1; i >= 0; i--) {
+    const base = standaloneLeaves[i].node.baseClass;
+    if (base && agentMemberClasses.has(base)) standaloneLeaves.splice(i, 1);
+  }
+
   // ── Build column-based layout ──
   interface LayoutBlock {
     type: 'agent-group' | 'dut' | 'standalone' | 'sequence-group';
@@ -345,11 +361,17 @@ function renderProject(roots: UvmDiagramNode[], duts: DutInfo[]): void {
   }
   const layoutBlocks: LayoutBlock[] = [];
 
-  // Agent groups
+  // Agent groups — members arranged horizontally within rows
   for (const g of agentGroups) {
-    const memberSizes = g.members.map(m => measureLeaf(m, connCounts));
-    const w = Math.max(BLOCK_MIN_W + 20, ...memberSizes.map(s => s.w)) + AGENT_PAD * 2;
-    const h = HEADER_H + memberSizes.reduce((s, m) => s + m.h + CHILD_GAP, 0) - CHILD_GAP + AGENT_PAD * 2;
+    const { row1, row2 } = agentRows(g.members);
+    const r1Sizes = row1.map(m => measureLeaf(m, connCounts));
+    const r2Sizes = row2.map(m => measureLeaf(m, connCounts));
+    const r1W = r1Sizes.reduce((s, sz) => s + sz.w + GAP_X, 0) - GAP_X;
+    const r1H = Math.max(...r1Sizes.map(sz => sz.h));
+    const r2W = r2Sizes.length > 0 ? r2Sizes.reduce((s, sz) => s + sz.w + GAP_X, 0) - GAP_X : 0;
+    const r2H = r2Sizes.length > 0 ? Math.max(...r2Sizes.map(sz => sz.h)) : 0;
+    const w = Math.max(BLOCK_MIN_W + 20, r1W, r2W) + AGENT_PAD * 2;
+    const h = HEADER_H + r1H + (row2.length > 0 ? CHILD_GAP + r2H : 0) + AGENT_PAD * 2;
     const minStage = Math.min(...g.members.map(m => STAGE[m.uvmType] ?? 3));
     layoutBlocks.push({ type: 'agent-group', stage: minStage, w, h, data: g });
   }
@@ -472,7 +494,7 @@ function drawContainerBox(parent: SVGGElement, node: UvmDiagramNode, x: number, 
   const badge = attrs(el('text'), { x: PAD / 2, y: TYPE_Y, class: 'df-type' }) as SVGTextElement;
   badge.textContent = `[${node.uvmType}]`; g.appendChild(badge);
   drawIcon(g, node.uvmType, w, theme.accent);
-  g.addEventListener('click', (e) => { e.stopPropagation(); vscode.postMessage({ command: 'openFile', filePath: node.filePath, line: node.line }); });
+  g.addEventListener('dblclick', (e) => { e.stopPropagation(); vscode.postMessage({ command: 'openFile', filePath: node.filePath, line: node.line }); });
   parent.appendChild(g);
 }
 
@@ -488,14 +510,30 @@ function drawAgentGroup(parent: SVGGElement, group: AgentGroup, x: number, y: nu
     const badge = attrs(el('text'), { x: PAD / 2, y: TYPE_Y, class: 'df-type' }) as SVGTextElement;
     badge.textContent = '[agent]'; g.appendChild(badge);
     drawIcon(g, 'agent', w, theme.accent);
-    g.addEventListener('click', (e) => { e.stopPropagation(); vscode.postMessage({ command: 'openFile', filePath: group.agent!.filePath, line: group.agent!.line }); });
+    g.addEventListener('dblclick', (e) => { e.stopPropagation(); vscode.postMessage({ command: 'openFile', filePath: group.agent!.filePath, line: group.agent!.line }); });
   }
-  let my = HEADER_H;
-  for (const member of group.members) {
-    const sz = measureLeaf(member, connCounts);
-    drawLeafBlock(g, member, AGENT_PAD, my, connCounts);
-    my += sz.h + CHILD_GAP;
+  // Arrange members horizontally: row1 = sequencer+driver, row2 = monitor etc.
+  const { row1, row2 } = agentRows(group.members);
+  const r1Sizes = row1.map(m => measureLeaf(m, connCounts));
+  const r1H = Math.max(...r1Sizes.map(sz => sz.h));
+
+  let rx = AGENT_PAD;
+  const r1Y = HEADER_H;
+  for (let i = 0; i < row1.length; i++) {
+    drawLeafBlock(g, row1[i], rx, r1Y + (r1H - r1Sizes[i].h) / 2, connCounts);
+    rx += r1Sizes[i].w + GAP_X;
   }
+
+  if (row2.length > 0) {
+    const r2Sizes = row2.map(m => measureLeaf(m, connCounts));
+    rx = AGENT_PAD;
+    const r2Y = HEADER_H + r1H + CHILD_GAP;
+    for (let i = 0; i < row2.length; i++) {
+      drawLeafBlock(g, row2[i], rx, r2Y + 0, connCounts);
+      rx += r2Sizes[i].w + GAP_X;
+    }
+  }
+
   parent.appendChild(g);
   const abs = absPos(g);
   if (group.agent) drawnBlocks.push({ x: abs.x, y: abs.y, w, h, node: group.agent, kind: 'uvm', stage: -1 });
@@ -528,7 +566,7 @@ function drawLeafBlock(parent: SVGGElement, node: UvmDiagramNode, x: number, y: 
   badge.textContent = `[${node.uvmType}]`; g.appendChild(badge);
   drawIcon(g, node.uvmType, sz.w, theme.accent);
   drawPorts(g, node, sz.w, sz.h, theme);
-  g.addEventListener('click', (e) => { e.stopPropagation(); vscode.postMessage({ command: 'openFile', filePath: node.filePath, line: node.line }); });
+  g.addEventListener('dblclick', (e) => { e.stopPropagation(); vscode.postMessage({ command: 'openFile', filePath: node.filePath, line: node.line }); });
   parent.appendChild(g);
   const abs = absPos(g);
   drawnBlocks.push({ x: abs.x, y: abs.y, w: sz.w, h: sz.h, node, kind: 'uvm', stage: STAGE[node.uvmType] ?? 3 });
@@ -551,7 +589,7 @@ function drawDutBlock(parent: SVGGElement, dut: DutInfo, x: number, y: number, w
     inst.textContent = `inst: ${dut.instanceName}`; g.appendChild(inst);
   }
   drawIcon(g, 'dut', w, theme.accent);
-  g.addEventListener('click', (e) => { e.stopPropagation(); vscode.postMessage({ command: 'openFile', filePath: dut.filePath, line: dut.line }); });
+  g.addEventListener('dblclick', (e) => { e.stopPropagation(); vscode.postMessage({ command: 'openFile', filePath: dut.filePath, line: dut.line }); });
   parent.appendChild(g);
   const dutNode: UvmDiagramNode = { className: dut.moduleName, uvmType: 'dut', baseClass: '', filePath: dut.filePath, line: dut.line, children: [], fields: [], tlmPorts: [], connections: [], virtualIfs: [] };
   const abs = absPos(g);
@@ -843,7 +881,7 @@ function routeDetour(x1: number, y1: number, x2: number, y2: number, obs: BlockR
   ];
 }
 
-function routeBackward(x1: number, y1: number, x2: number, y2: number, obs: BlockRect[]): Pt[] {
+function routeBackward(x1: number, y1: number, x2: number, y2: number, _obs: BlockRect[]): Pt[] {
   // Route above all blocks via perimeter
   const allMinY = drawnBlocks.length > 0 ? Math.min(...drawnBlocks.map(b => b.y)) : Math.min(y1, y2);
   const routeY = Math.round(allMinY - PERIMETER_MARGIN * 2);
@@ -1018,7 +1056,7 @@ function drawArrow(parent: SVGGElement, ra: RoutedArrow): void {
     const title = el('title') as SVGTitleElement;
     title.textContent = `Click to open connection (line ${a.line})`;
     arrowPath.appendChild(title);
-    arrowPath.addEventListener('click', () => { vscode.postMessage({ command: 'openFile', filePath: a.filePath, line: a.line }); });
+    arrowPath.addEventListener('dblclick', () => { vscode.postMessage({ command: 'openFile', filePath: a.filePath, line: a.line }); });
   }
   parent.appendChild(arrowPath);
 
