@@ -108,6 +108,8 @@ interface BlockRect {
   stage: number;
 }
 let drawnBlocks: BlockRect[] = [];
+let drawnContainers: { x: number; y: number; w: number; h: number }[] = [];
+let drawnLabels: { x: number; y: number; w: number; h: number }[] = [];
 
 // ─── Project state ────────────────────────────────────────────
 let allProjects: ProjectData[] = [];
@@ -311,6 +313,8 @@ function renderProject(roots: UvmDiagramNode[], duts: DutInfo[]): void {
   empty.style.display = 'none'; ctr.style.display = 'block';
   while (rootG.firstChild) rootG.removeChild(rootG.firstChild);
   drawnBlocks = [];
+  drawnContainers = [];
+  drawnLabels = [];
 
   // Pre-pass: count connections per block per side
   const connCounts = countConnections(roots, duts);
@@ -501,6 +505,7 @@ function drawContainerBox(parent: SVGGElement, node: UvmDiagramNode, x: number, 
   drawIcon(g, node.uvmType, w, theme.accent);
   g.addEventListener('dblclick', (e) => { e.stopPropagation(); vscode.postMessage({ command: 'openFile', filePath: node.filePath, line: node.line }); });
   parent.appendChild(g);
+  drawnContainers.push({ x, y, w, h });
 }
 
 function drawAgentGroup(parent: SVGGElement, group: AgentGroup, x: number, y: number, w: number, h: number, connCounts: Map<string, number>): void {
@@ -541,7 +546,10 @@ function drawAgentGroup(parent: SVGGElement, group: AgentGroup, x: number, y: nu
 
   parent.appendChild(g);
   const abs = absPos(g);
-  if (group.agent) drawnBlocks.push({ x: abs.x, y: abs.y, w, h, node: group.agent, kind: 'uvm', stage: -1 });
+  if (group.agent) {
+    drawnBlocks.push({ x: abs.x, y: abs.y, w, h, node: group.agent, kind: 'uvm', stage: -1 });
+    drawnContainers.push({ x: abs.x, y: abs.y, w, h });
+  }
 }
 
 function drawSequenceGroup(parent: SVGGElement, seqs: { node: UvmDiagramNode }[], x: number, y: number, w: number, h: number, connCounts: Map<string, number>): void {
@@ -769,7 +777,13 @@ function buildOccGrid(): OccGrid {
   const cols = Math.min(500, Math.ceil((maxPx - ox) / GRID) + BORDER * 2);
   const rows = Math.min(500, Math.ceil((maxPy - oy) / GRID) + BORDER * 2);
   const data = new Uint8Array(rows * cols);
+  const gMark = (gc: number, gr: number) => {
+    if (gc >= 0 && gc < cols && gr >= 0 && gr < rows) data[gr * cols + gc] = 1;
+  };
+
+  // Mark solid blocks (stage >= 0) as impassable — skip containers
   for (const b of drawnBlocks) {
+    if (b.stage < 0) continue;
     const c0 = Math.floor((b.x - ox) / GRID) - ROUTE_MARGIN;
     const c1 = Math.ceil((b.x + b.w - ox) / GRID) + ROUTE_MARGIN;
     const r0 = Math.floor((b.y - oy) / GRID) - ROUTE_MARGIN;
@@ -778,6 +792,23 @@ function buildOccGrid(): OccGrid {
       for (let c = Math.max(0, c0); c <= Math.min(cols - 1, c1); c++)
         data[r * cols + c] = 1;
   }
+
+  // Mark container borders (agents, envs) so connections avoid them
+  for (const ct of drawnContainers) {
+    const cL = Math.round((ct.x - ox) / GRID);
+    const cR = Math.round((ct.x + ct.w - ox) / GRID);
+    const rT = Math.round((ct.y - oy) / GRID);
+    const rB = Math.round((ct.y + ct.h - oy) / GRID);
+    // Top & bottom edges
+    for (let c = cL; c <= cR; c++) {
+      for (let dr = -1; dr <= 1; dr++) { gMark(c, rT + dr); gMark(c, rB + dr); }
+    }
+    // Left & right edges
+    for (let r = rT; r <= rB; r++) {
+      for (let dc = -1; dc <= 1; dc++) { gMark(cL + dc, r); gMark(cR + dc, r); }
+    }
+  }
+
   return { cols, rows, data, ox, oy };
 }
 
@@ -970,29 +1001,58 @@ function routeAndDrawArrows(parent: SVGGElement, arrows: Arrow[]): void {
     (Math.abs(a.srcX - a.tgtX) + Math.abs(a.srcY - a.tgtY)) -
     (Math.abs(b.srcX - b.tgtX) + Math.abs(b.srcY - b.tgtY)));
 
+  const CORRIDOR_LEN = Math.ceil(STUB_LEN / GRID) + ROUTE_MARGIN + 3;
+
   for (const ra of sorted) {
-    // Temporarily unblock source and target blocks so A* can exit/enter
-    const savedCells: number[] = [];
     const savedIdxs: number[] = [];
+    const savedVals: number[] = [];
+    const clearCell = (gc: number, gr: number) => {
+      if (gc >= 0 && gc < grid.cols && gr >= 0 && gr < grid.rows) {
+        const gi = gr * grid.cols + gc;
+        if (grid.data[gi]) { savedIdxs.push(gi); savedVals.push(grid.data[gi]); grid.data[gi] = 0; }
+      }
+    };
+
+    // Unblock source and target blocks + margins
     for (const blk of [ra.arrow.from, ra.arrow.to]) {
       const c0 = Math.floor((blk.x - grid.ox) / GRID) - ROUTE_MARGIN;
       const c1 = Math.ceil((blk.x + blk.w - grid.ox) / GRID) + ROUTE_MARGIN;
       const r0 = Math.floor((blk.y - grid.oy) / GRID) - ROUTE_MARGIN;
       const r1 = Math.ceil((blk.y + blk.h - grid.oy) / GRID) + ROUTE_MARGIN;
       for (let r = Math.max(0, r0); r <= Math.min(grid.rows - 1, r1); r++)
-        for (let c = Math.max(0, c0); c <= Math.min(grid.cols - 1, c1); c++) {
-          const gi = r * grid.cols + c;
-          if (grid.data[gi]) { savedIdxs.push(gi); savedCells.push(grid.data[gi]); grid.data[gi] = 0; }
-        }
+        for (let c = Math.max(0, c0); c <= Math.min(grid.cols - 1, c1); c++)
+          clearCell(c, r);
     }
 
-    const path = gridRoute(ra.srcX, ra.srcY, ra.tgtX, ra.tgtY, grid, true);
+    // Clear rightward corridor from source port (cuts through container borders)
+    const srcCol = Math.round((ra.srcX - grid.ox) / GRID);
+    const srcRow = Math.round((ra.srcY - grid.oy) / GRID);
+    for (let c = srcCol; c <= srcCol + CORRIDOR_LEN; c++) clearCell(c, srcRow);
 
-    // Restore unblocked cells
-    for (let i = 0; i < savedIdxs.length; i++) grid.data[savedIdxs[i]] = savedCells[i];
+    // Clear leftward corridor into target port
+    const tgtCol = Math.round((ra.tgtX - grid.ox) / GRID);
+    const tgtRow = Math.round((ra.tgtY - grid.oy) / GRID);
+    for (let c = tgtCol; c >= tgtCol - CORRIDOR_LEN; c--) clearCell(c, tgtRow);
 
-    ra.waypoints = path;
-    markPathOnGrid(path, grid);
+    // Route A* between stub endpoints — stubs guarantee arrowheads point right
+    const stubSX = snap(ra.srcX + STUB_LEN);
+    const stubTX = snap(ra.tgtX - STUB_LEN);
+    const path = gridRoute(stubSX, ra.srcY, stubTX, ra.tgtY, grid, true);
+
+    // Restore cleared cells
+    for (let i = 0; i < savedIdxs.length; i++) grid.data[savedIdxs[i]] = savedVals[i];
+
+    // Compose: src port → stub → A* path → stub → tgt port
+    const wp: Pt[] = [{ x: ra.srcX, y: ra.srcY }];
+    for (const p of path) {
+      const last = wp[wp.length - 1];
+      if (Math.abs(last.x - p.x) > 1 || Math.abs(last.y - p.y) > 1) wp.push(p);
+    }
+    const tgt = { x: ra.tgtX, y: ra.tgtY };
+    if (Math.abs(wp[wp.length - 1].x - tgt.x) > 1 || Math.abs(wp[wp.length - 1].y - tgt.y) > 1)
+      wp.push(tgt);
+    ra.waypoints = wp;
+    markPathOnGrid(wp, grid);
   }
 
   // Draw all arrows and junctions
@@ -1080,16 +1140,31 @@ function drawArrow(parent: SVGGElement, ra: RoutedArrow): void {
     }
     segs.sort((s1, s2) => s2.len - s1.len);
 
+    const lblOverlaps = (lLeft: number, lTop: number) => {
+      const lRight = lLeft + tw, lBot = lTop + th;
+      const hit = (bx: number, by: number, bw: number, bh: number) =>
+        lLeft < bx + bw + 4 && lRight > bx - 4 && lTop < by + bh + 4 && lBot > by - 4;
+      return drawnBlocks.some(b => b.stage >= 0 && hit(b.x, b.y, b.w, b.h)) ||
+             drawnContainers.some(c => hit(c.x, c.y, c.w, c.h)) ||
+             drawnLabels.some(l => hit(l.x, l.y, l.w, l.h));
+    };
+
     let lx = 0, ly = 0, placed = false;
     for (const seg of segs) {
       const cx = seg.isVert ? seg.mx + tw / 2 + 6 : seg.mx;
       const cy = seg.isVert ? seg.my : seg.my - 12;
-      const lLeft = cx - tw / 2, lTop = cy - th / 2;
-      const overlaps = drawnBlocks.some(b =>
-        lLeft < b.x + b.w + 4 && lLeft + tw > b.x - 4 &&
-        lTop < b.y + b.h + 4 && lTop + th > b.y - 4
-      );
-      if (!overlaps) { lx = cx; ly = cy; placed = true; break; }
+      if (!lblOverlaps(cx - tw / 2, cy - th / 2)) { lx = cx; ly = cy; placed = true; break; }
+    }
+    // Try offset positions if primary placements overlap
+    if (!placed) {
+      for (const seg of segs) {
+        for (const [ox, oy] of [[0, -th - 6], [0, th + 6], [tw, 0], [-tw, 0]]) {
+          const cx = (seg.isVert ? seg.mx + tw / 2 + 6 : seg.mx) + ox;
+          const cy = (seg.isVert ? seg.my : seg.my - 12) + oy;
+          if (!lblOverlaps(cx - tw / 2, cy - th / 2)) { lx = cx; ly = cy; placed = true; break; }
+        }
+        if (placed) break;
+      }
     }
     if (!placed && segs.length > 0) {
       const seg = segs[0];
@@ -1097,6 +1172,7 @@ function drawArrow(parent: SVGGElement, ra: RoutedArrow): void {
       ly = seg.isVert ? seg.my : seg.my - th - 4;
     }
     if (segs.length > 0) {
+      drawnLabels.push({ x: lx - tw / 2, y: ly - th / 2, w: tw, h: th });
       parent.appendChild(attrs(el('rect'), { x: lx - tw / 2, y: ly - 7, width: tw, height: th, rx: 3, fill: '#111', opacity: 0.92, stroke: a.color, 'stroke-width': 0.5 }));
       const lbl = attrs(el('text'), { x: lx, y: ly + 3, 'text-anchor': 'middle', 'font-size': 8, fill: a.color, class: 'df-arrow-label' }) as SVGTextElement;
       lbl.textContent = displayLabel;
