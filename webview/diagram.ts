@@ -782,7 +782,7 @@ function buildOccGrid(): OccGrid {
 }
 
 function gridRoute(
-  sx: number, sy: number, tx: number, ty: number, grid: OccGrid
+  sx: number, sy: number, tx: number, ty: number, grid: OccGrid, firstRight = false
 ): Pt[] {
   const { cols, rows, data } = grid;
   const clamp = (v: number, mx: number) => Math.max(0, Math.min(mx - 1, v));
@@ -822,9 +822,10 @@ function gridRoute(
     return top;
   };
 
-  // Seed all 4 directions from start
+  // Seed directions from start (firstRight: only direction 0 = right)
   for (let d = 0; d < 4; d++) dist[idx(sc, sr, d)] = 0;
-  for (let d = 0; d < 4; d++) {
+  const seedDirs = firstRight ? [0] : [0, 1, 2, 3];
+  for (const d of seedDirs) {
     const nc = sc + DC[d], nr = sr + DR[d];
     if (nc < 0 || nc >= cols || nr < 0 || nr >= rows) continue;
     if (data[nr * cols + nc] !== 0) continue;
@@ -850,10 +851,15 @@ function gridRoute(
   }
 
   if (found < 0) {
-    // Fallback: Z-route
-    const mx = snap((sx + tx) / 2);
-    if (Math.abs(sy - ty) < GRID) return [{ x: sx, y: sy }, { x: tx, y: ty }];
-    return [{ x: sx, y: sy }, { x: mx, y: sy }, { x: mx, y: ty }, { x: tx, y: ty }];
+    // Fallback: route above all blocks via perimeter (never through them)
+    const topY = grid.oy + GRID;
+    const exitX = snap(sx + STUB_LEN);
+    const entryX = snap(tx - STUB_LEN);
+    return [
+      { x: sx, y: sy }, { x: exitX, y: sy },
+      { x: exitX, y: topY }, { x: entryX, y: topY },
+      { x: entryX, y: ty }, { x: tx, y: ty },
+    ];
   }
 
   // Reconstruct grid path
@@ -890,21 +896,24 @@ function gridRoute(
 
 function markPathOnGrid(waypoints: Pt[], grid: OccGrid): void {
   const { cols, rows, data } = grid;
+  const mark = (mc: number, mr: number) => {
+    if (mc >= 0 && mc < cols && mr >= 0 && mr < rows) data[mr * cols + mc] = 1;
+  };
   for (let i = 0; i < waypoints.length - 1; i++) {
     const c0 = Math.round((waypoints[i].x - grid.ox) / GRID);
     const r0 = Math.round((waypoints[i].y - grid.oy) / GRID);
     const c1 = Math.round((waypoints[i + 1].x - grid.ox) / GRID);
     const r1 = Math.round((waypoints[i + 1].y - grid.oy) / GRID);
     if (Math.abs(c0 - c1) < 1) {
-      // Vertical segment
+      // Vertical segment — mark column ± 1 for clearance
       const c = c0, rMin = Math.min(r0, r1), rMax = Math.max(r0, r1);
       for (let r = rMin; r <= rMax; r++)
-        if (c >= 0 && c < cols && r >= 0 && r < rows) data[r * cols + c] = 1;
+        for (let dc = -1; dc <= 1; dc++) mark(c + dc, r);
     } else {
-      // Horizontal segment
+      // Horizontal segment — mark row ± 1 for clearance
       const r = r0, cMin = Math.min(c0, c1), cMax = Math.max(c0, c1);
       for (let c = cMin; c <= cMax; c++)
-        if (c >= 0 && c < cols && r >= 0 && r < rows) data[r * cols + c] = 1;
+        for (let dr = -1; dr <= 1; dr++) mark(c, r + dr);
     }
   }
 }
@@ -962,40 +971,27 @@ function routeAndDrawArrows(parent: SVGGElement, arrows: Arrow[]): void {
     (Math.abs(b.srcX - b.tgtX) + Math.abs(b.srcY - b.tgtY)));
 
   for (const ra of sorted) {
-    const stubSX = snap(ra.srcX + STUB_LEN);
-    const stubTX = snap(ra.tgtX - STUB_LEN);
-
-    // Temporarily clear start/end cells if inside block margin
-    const cells: [number, number][] = [];
-    const savedVals: number[] = [];
-    for (const [px, py] of [[stubSX, ra.srcY], [stubTX, ra.tgtY]] as [number, number][]) {
-      const gc = Math.round((px - grid.ox) / GRID);
-      const gr = Math.round((py - grid.oy) / GRID);
-      if (gc >= 0 && gc < grid.cols && gr >= 0 && gr < grid.rows) {
-        cells.push([gc, gr]);
-        savedVals.push(grid.data[gr * grid.cols + gc]);
-        grid.data[gr * grid.cols + gc] = 0;
-      }
+    // Temporarily unblock source and target blocks so A* can exit/enter
+    const savedCells: number[] = [];
+    const savedIdxs: number[] = [];
+    for (const blk of [ra.arrow.from, ra.arrow.to]) {
+      const c0 = Math.floor((blk.x - grid.ox) / GRID) - ROUTE_MARGIN;
+      const c1 = Math.ceil((blk.x + blk.w - grid.ox) / GRID) + ROUTE_MARGIN;
+      const r0 = Math.floor((blk.y - grid.oy) / GRID) - ROUTE_MARGIN;
+      const r1 = Math.ceil((blk.y + blk.h - grid.oy) / GRID) + ROUTE_MARGIN;
+      for (let r = Math.max(0, r0); r <= Math.min(grid.rows - 1, r1); r++)
+        for (let c = Math.max(0, c0); c <= Math.min(grid.cols - 1, c1); c++) {
+          const gi = r * grid.cols + c;
+          if (grid.data[gi]) { savedIdxs.push(gi); savedCells.push(grid.data[gi]); grid.data[gi] = 0; }
+        }
     }
 
-    const path = gridRoute(stubSX, ra.srcY, stubTX, ra.tgtY, grid);
+    const path = gridRoute(ra.srcX, ra.srcY, ra.tgtX, ra.tgtY, grid, true);
 
-    // Restore cleared cells
-    for (let i = 0; i < cells.length; i++)
-      grid.data[cells[i][1] * grid.cols + cells[i][0]] = savedVals[i];
+    // Restore unblocked cells
+    for (let i = 0; i < savedIdxs.length; i++) grid.data[savedIdxs[i]] = savedCells[i];
 
-    // Full path: src port → rightward stub → A* path → leftward stub → tgt port
-    const wp: Pt[] = [{ x: ra.srcX, y: ra.srcY }];
-    for (const p of path) {
-      const last = wp[wp.length - 1];
-      if (Math.abs(last.x - p.x) > 1 || Math.abs(last.y - p.y) > 1) wp.push(p);
-    }
-    const tgt = { x: ra.tgtX, y: ra.tgtY };
-    if (Math.abs(wp[wp.length - 1].x - tgt.x) > 1 || Math.abs(wp[wp.length - 1].y - tgt.y) > 1)
-      wp.push(tgt);
-    ra.waypoints = wp;
-
-    // Mark routed path so subsequent routes avoid it
+    ra.waypoints = path;
     markPathOnGrid(path, grid);
   }
 
