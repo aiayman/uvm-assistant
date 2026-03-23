@@ -1,5 +1,5 @@
 /**
- * UVM Data Flow Diagram — channel-based placement & routing.
+ * UVM Data Flow Diagram — grid-based placement & routing.
  *
  * Blocks are arranged left-to-right by their role in the UVM data pipeline:
  *   Sequence → Sequencer → Driver → [DUT] → Monitor → Scoreboard
@@ -65,6 +65,11 @@ const AGENT_PAD = 20;
 const CHANNEL_MIN_W = 40;
 const STUB_LEN = 16;
 const PERIMETER_MARGIN = 16;
+
+// Grid routing
+const GRID = 10;
+const ROUTE_MARGIN = 1;
+function snap(v: number): number { return Math.round(v / GRID) * GRID; }
 
 // Pipeline stage order (lower = further left)
 const STAGE: Record<string, number> = {
@@ -423,8 +428,8 @@ function renderProject(roots: UvmDiagramNode[], duts: DutInfo[]): void {
   }
   const sortedStages = [...stageGroups.keys()].sort((a, b) => a - b);
 
-  const startX = PAD + (testNode ? PAD : 0) + (envNode ? PAD : 0);
-  const baseY = PAD + testHeaderH + envHeaderH;
+  const startX = snap(PAD + (testNode ? PAD : 0) + (envNode ? PAD : 0));
+  const baseY = snap(PAD + testHeaderH + envHeaderH);
 
   const blockPositions: { block: LayoutBlock; x: number; y: number }[] = [];
   let curX = startX;
@@ -436,12 +441,12 @@ function renderProject(roots: UvmDiagramNode[], duts: DutInfo[]): void {
 
     let curY = baseY;
     for (const block of blocks) {
-      blockPositions.push({ block, x: curX + (colW - block.w) / 2, y: curY });
-      curY += block.h + GAP_Y;
+      blockPositions.push({ block, x: snap(curX + (colW - block.w) / 2), y: snap(curY) });
+      curY = snap(curY + block.h + GAP_Y);
     }
 
-    curX += colW;
-    if (si < sortedStages.length - 1) curX += GAP_X + CHANNEL_MIN_W;
+    curX = snap(curX + colW);
+    if (si < sortedStages.length - 1) curX = snap(curX + GAP_X + CHANNEL_MIN_W);
   }
 
   // Compute bounding box of all placed blocks
@@ -740,7 +745,169 @@ function nearest(block: BlockRect, targets: BlockRect[]): BlockRect {
   return best;
 }
 
-// ─── Channel-based orthogonal router ──────────────────────────
+// ─── Grid-based orthogonal router (A*) ────────────────────────
+
+interface OccGrid {
+  cols: number; rows: number;
+  data: Uint8Array;
+  ox: number; oy: number;
+}
+
+function buildOccGrid(): OccGrid {
+  if (drawnBlocks.length === 0)
+    return { cols: 1, rows: 1, data: new Uint8Array(1), ox: 0, oy: 0 };
+  const BORDER = 8;
+  let minPx = Infinity, minPy = Infinity, maxPx = -Infinity, maxPy = -Infinity;
+  for (const b of drawnBlocks) {
+    if (b.x < minPx) minPx = b.x;
+    if (b.y < minPy) minPy = b.y;
+    if (b.x + b.w > maxPx) maxPx = b.x + b.w;
+    if (b.y + b.h > maxPy) maxPy = b.y + b.h;
+  }
+  const ox = snap(minPx) - BORDER * GRID;
+  const oy = snap(minPy) - BORDER * GRID;
+  const cols = Math.min(500, Math.ceil((maxPx - ox) / GRID) + BORDER * 2);
+  const rows = Math.min(500, Math.ceil((maxPy - oy) / GRID) + BORDER * 2);
+  const data = new Uint8Array(rows * cols);
+  for (const b of drawnBlocks) {
+    const c0 = Math.floor((b.x - ox) / GRID) - ROUTE_MARGIN;
+    const c1 = Math.ceil((b.x + b.w - ox) / GRID) + ROUTE_MARGIN;
+    const r0 = Math.floor((b.y - oy) / GRID) - ROUTE_MARGIN;
+    const r1 = Math.ceil((b.y + b.h - oy) / GRID) + ROUTE_MARGIN;
+    for (let r = Math.max(0, r0); r <= Math.min(rows - 1, r1); r++)
+      for (let c = Math.max(0, c0); c <= Math.min(cols - 1, c1); c++)
+        data[r * cols + c] = 1;
+  }
+  return { cols, rows, data, ox, oy };
+}
+
+function gridRoute(
+  sx: number, sy: number, tx: number, ty: number, grid: OccGrid
+): Pt[] {
+  const { cols, rows, data } = grid;
+  const clamp = (v: number, mx: number) => Math.max(0, Math.min(mx - 1, v));
+  const sc = clamp(Math.round((sx - grid.ox) / GRID), cols);
+  const sr = clamp(Math.round((sy - grid.oy) / GRID), rows);
+  const tc = clamp(Math.round((tx - grid.ox) / GRID), cols);
+  const tr = clamp(Math.round((ty - grid.oy) / GRID), rows);
+  if (sc === tc && sr === tr)
+    return [{ x: sx, y: sy }, { x: tx, y: ty }];
+
+  const DC = [1, 0, -1, 0], DR = [0, 1, 0, -1];
+  const TURN_COST = 3;
+  const stateCount = rows * cols * 4;
+  const dist = new Float32Array(stateCount).fill(Infinity);
+  const prev = new Int32Array(stateCount).fill(-1);
+  const idx = (c: number, r: number, d: number) => (r * cols + c) * 4 + d;
+  const heur = (c: number, r: number) => Math.abs(c - tc) + Math.abs(r - tr);
+
+  // Min-heap of [fScore, stateIdx]
+  const heap: [number, number][] = [];
+  const hpush = (f: number, si: number) => {
+    heap.push([f, si]); let i = heap.length - 1;
+    while (i > 0) { const p = (i - 1) >> 1; if (heap[p][0] <= heap[i][0]) break; [heap[p], heap[i]] = [heap[i], heap[p]]; i = p; }
+  };
+  const hpop = (): [number, number] | undefined => {
+    if (!heap.length) return undefined;
+    const top = heap[0]; const last = heap.pop()!;
+    if (heap.length) {
+      heap[0] = last; let i = 0;
+      for (;;) {
+        let s = i; const l = 2 * i + 1, ri = 2 * i + 2;
+        if (l < heap.length && heap[l][0] < heap[s][0]) s = l;
+        if (ri < heap.length && heap[ri][0] < heap[s][0]) s = ri;
+        if (s === i) break; [heap[i], heap[s]] = [heap[s], heap[i]]; i = s;
+      }
+    }
+    return top;
+  };
+
+  // Seed all 4 directions from start
+  for (let d = 0; d < 4; d++) dist[idx(sc, sr, d)] = 0;
+  for (let d = 0; d < 4; d++) {
+    const nc = sc + DC[d], nr = sr + DR[d];
+    if (nc < 0 || nc >= cols || nr < 0 || nr >= rows) continue;
+    if (data[nr * cols + nc] !== 0) continue;
+    const si = idx(nc, nr, d);
+    dist[si] = 1; prev[si] = idx(sc, sr, d);
+    hpush(1 + heur(nc, nr), si);
+  }
+
+  let found = -1, iters = 0;
+  const maxIters = Math.min(stateCount, 200000);
+  while (heap.length && iters++ < maxIters) {
+    const [, si] = hpop()!;
+    const d = si & 3, ci = si >> 2, c = ci % cols, r = (ci - c) / cols;
+    const g = dist[si];
+    if (c === tc && r === tr) { found = si; break; }
+    for (let nd = 0; nd < 4; nd++) {
+      const nc = c + DC[nd], nr = r + DR[nd];
+      if (nc < 0 || nc >= cols || nr < 0 || nr >= rows || data[nr * cols + nc]) continue;
+      const ng = g + 1 + (nd !== d ? TURN_COST : 0);
+      const nsi = idx(nc, nr, nd);
+      if (ng < dist[nsi]) { dist[nsi] = ng; prev[nsi] = si; hpush(ng + heur(nc, nr), nsi); }
+    }
+  }
+
+  if (found < 0) {
+    // Fallback: Z-route
+    const mx = snap((sx + tx) / 2);
+    if (Math.abs(sy - ty) < GRID) return [{ x: sx, y: sy }, { x: tx, y: ty }];
+    return [{ x: sx, y: sy }, { x: mx, y: sy }, { x: mx, y: ty }, { x: tx, y: ty }];
+  }
+
+  // Reconstruct grid path
+  const gp: [number, number][] = [];
+  let cur = found;
+  while (cur >= 0) {
+    const ci = cur >> 2, c = ci % cols, r = (ci - c) / cols;
+    gp.push([c, r]);
+    if (c === sc && r === sr) break;
+    cur = prev[cur];
+  }
+  gp.reverse();
+
+  // Collapse collinear cells into waypoints
+  const pts: Pt[] = [];
+  for (const [c, r] of gp) {
+    const px = c * GRID + grid.ox, py = r * GRID + grid.oy;
+    const n = pts.length;
+    if (n >= 2) {
+      const p1 = pts[n - 1], p2 = pts[n - 2];
+      if ((Math.abs(p1.x - px) < 1 && Math.abs(p2.x - px) < 1) ||
+          (Math.abs(p1.y - py) < 1 && Math.abs(p2.y - py) < 1)) {
+        p1.x = px; p1.y = py; continue;
+      }
+    }
+    pts.push({ x: px, y: py });
+  }
+  if (pts.length >= 1) {
+    pts[0] = { x: sx, y: sy };
+    pts[pts.length - 1] = { x: tx, y: ty };
+  }
+  return pts;
+}
+
+function markPathOnGrid(waypoints: Pt[], grid: OccGrid): void {
+  const { cols, rows, data } = grid;
+  for (let i = 0; i < waypoints.length - 1; i++) {
+    const c0 = Math.round((waypoints[i].x - grid.ox) / GRID);
+    const r0 = Math.round((waypoints[i].y - grid.oy) / GRID);
+    const c1 = Math.round((waypoints[i + 1].x - grid.ox) / GRID);
+    const r1 = Math.round((waypoints[i + 1].y - grid.oy) / GRID);
+    if (Math.abs(c0 - c1) < 1) {
+      // Vertical segment
+      const c = c0, rMin = Math.min(r0, r1), rMax = Math.max(r0, r1);
+      for (let r = rMin; r <= rMax; r++)
+        if (c >= 0 && c < cols && r >= 0 && r < rows) data[r * cols + c] = 1;
+    } else {
+      // Horizontal segment
+      const r = r0, cMin = Math.min(c0, c1), cMax = Math.max(c0, c1);
+      for (let c = cMin; c <= cMax; c++)
+        if (c >= 0 && c < cols && r >= 0 && r < rows) data[r * cols + c] = 1;
+    }
+  }
+}
 
 interface RoutedArrow {
   arrow: Arrow;
@@ -750,249 +917,91 @@ interface RoutedArrow {
 }
 
 function routeAndDrawArrows(parent: SVGGElement, arrows: Arrow[]): void {
-  const routed: RoutedArrow[] = [];
-  for (const a of arrows) {
-    routed.push({ arrow: a, srcX: 0, srcY: 0, tgtX: 0, tgtY: 0, waypoints: [] });
-  }
+  const routed: RoutedArrow[] = arrows.map(a =>
+    ({ arrow: a, srcX: 0, srcY: 0, tgtX: 0, tgtY: 0, waypoints: [] }));
 
-  // Step 1: Assign port slots — always exit RIGHT, enter LEFT
+  // Assign port slots — exit RIGHT, enter LEFT
   const srcSlotMap = new Map<string, RoutedArrow[]>();
   const tgtSlotMap = new Map<string, RoutedArrow[]>();
-
   for (const ra of routed) {
-    const sk = ra.arrow.from.node.className;
-    const tk = ra.arrow.to.node.className;
+    const sk = ra.arrow.from.node.className, tk = ra.arrow.to.node.className;
     if (!srcSlotMap.has(sk)) srcSlotMap.set(sk, []);
     srcSlotMap.get(sk)!.push(ra);
     if (!tgtSlotMap.has(tk)) tgtSlotMap.set(tk, []);
     tgtSlotMap.get(tk)!.push(ra);
   }
 
-  // Distribute exit points on right side of source blocks
   for (const [, ras] of srcSlotMap) {
     const block = ras[0].arrow.from;
     ras.sort((a, b) => (a.arrow.to.y + a.arrow.to.h / 2) - (b.arrow.to.y + b.arrow.to.h / 2));
-    const count = ras.length;
-    const totalSpan = (count - 1) * PORT_GAP;
-    const startY = block.y + (block.h - totalSpan) / 2;
+    const count = ras.length, span = (count - 1) * PORT_GAP;
+    const baseY = block.y + (block.h - span) / 2;
     for (let i = 0; i < count; i++) {
-      ras[i].srcX = block.x + block.w;
-      ras[i].srcY = count === 1 ? block.y + block.h / 2 : startY + i * PORT_GAP;
+      ras[i].srcX = snap(block.x + block.w);
+      ras[i].srcY = snap(count === 1 ? block.y + block.h / 2 : baseY + i * PORT_GAP);
     }
   }
 
-  // Distribute entry points on left side of target blocks
   for (const [, ras] of tgtSlotMap) {
     const block = ras[0].arrow.to;
     ras.sort((a, b) => (a.arrow.from.y + a.arrow.from.h / 2) - (b.arrow.from.y + b.arrow.from.h / 2));
-    const count = ras.length;
-    const totalSpan = (count - 1) * PORT_GAP;
-    const startY = block.y + (block.h - totalSpan) / 2;
+    const count = ras.length, span = (count - 1) * PORT_GAP;
+    const baseY = block.y + (block.h - span) / 2;
     for (let i = 0; i < count; i++) {
-      ras[i].tgtX = block.x;
-      ras[i].tgtY = count === 1 ? block.y + block.h / 2 : startY + i * PORT_GAP;
+      ras[i].tgtX = snap(block.x);
+      ras[i].tgtY = snap(count === 1 ? block.y + block.h / 2 : baseY + i * PORT_GAP);
     }
   }
 
-  // Step 2: Route each arrow through channels
-  const obs = drawnBlocks.filter(b => b.stage >= 0); // only leaf blocks are obstacles
-  for (const ra of routed) routeArrow(ra, obs);
+  // Build occupancy grid
+  const grid = buildOccGrid();
 
-  // Step 3: Deconflict parallel tracks
-  deconflictTracks(routed);
+  // Route shorter connections first to minimize crossings
+  const sorted = [...routed].sort((a, b) =>
+    (Math.abs(a.srcX - a.tgtX) + Math.abs(a.srcY - a.tgtY)) -
+    (Math.abs(b.srcX - b.tgtX) + Math.abs(b.srcY - b.tgtY)));
 
-  // Step 4: Draw
-  for (const ra of routed) drawArrow(parent, ra);
+  for (const ra of sorted) {
+    const stubSX = snap(ra.srcX + STUB_LEN);
+    const stubTX = snap(ra.tgtX - STUB_LEN);
 
-  // Step 5: Draw junction indicators for shared ports
-  drawJunctions(parent, routed);
-}
-
-function routeArrow(ra: RoutedArrow, obs: BlockRect[]): void {
-  const { srcX: x1, srcY: y1, tgtX: x2, tgtY: y2, arrow } = ra;
-
-  // Filter out source and target from obstacles
-  const myObs = obs.filter(b =>
-    b.node.className !== arrow.from.node.className &&
-    b.node.className !== arrow.to.node.className
-  );
-
-  if (x2 > x1 + 2) {
-    // Forward: target is to the right
-    ra.waypoints = routeForward(x1, y1, x2, y2, myObs);
-  } else {
-    // Backward: target is to the left — route around via perimeter
-    ra.waypoints = routeBackward(x1, y1, x2, y2, myObs);
-  }
-}
-
-function routeForward(x1: number, y1: number, x2: number, y2: number, obs: BlockRect[]): Pt[] {
-  // Horizontal stub out of source
-  const stubX = x1 + STUB_LEN;
-
-  if (Math.abs(y1 - y2) < 3) {
-    // Nearly same Y: snap and try direct horizontal
-    const snapY = Math.round((y1 + y2) / 2);
-    if (!hSegHitsBlock(x1, x2, snapY, obs)) {
-      return [{ x: x1, y: snapY }, { x: x2, y: snapY }];
-    }
-  }
-
-  // Find a clear vertical channel between stub and target
-  const channelX = findClearVChannel(stubX, x2 - STUB_LEN, y1, y2, obs);
-
-  // Check if Z-shape works
-  if (!hSegHitsBlock(x1, channelX, y1, obs) &&
-      !vSegHitsBlock(channelX, y1, y2, obs) &&
-      !hSegHitsBlock(channelX, x2, y2, obs)) {
-    if (Math.abs(y1 - y2) < 3) {
-      return [{ x: x1, y: y1 }, { x: x2, y: y1 }];
-    }
-    return [{ x: x1, y: y1 }, { x: channelX, y: y1 }, { x: channelX, y: y2 }, { x: x2, y: y2 }];
-  }
-
-  // Detour above or below obstacles
-  return routeDetour(x1, y1, x2, y2, obs);
-}
-
-function routeDetour(x1: number, y1: number, x2: number, y2: number, obs: BlockRect[]): Pt[] {
-  const xMin = Math.min(x1, x2), xMax = Math.max(x1, x2);
-  const blockers = obs.filter(b => b.x + b.w > xMin && b.x < xMax);
-
-  if (blockers.length === 0) {
-    const midX = Math.round((x1 + x2) / 2);
-    if (Math.abs(y1 - y2) < 2) return [{ x: x1, y: y1 }, { x: x2, y: y2 }];
-    return [{ x: x1, y: y1 }, { x: midX, y: y1 }, { x: midX, y: y2 }, { x: x2, y: y2 }];
-  }
-
-  const minBY = Math.min(...blockers.map(b => b.y));
-  const maxBY = Math.max(...blockers.map(b => b.y + b.h));
-  const above = minBY - BLOCK_ARROW_GAP * 3;
-  const below = maxBY + BLOCK_ARROW_GAP * 3;
-  const detourY = (Math.abs(y1 - above) + Math.abs(y2 - above) < Math.abs(y1 - below) + Math.abs(y2 - below)) ? above : below;
-
-  const vx1 = x1 + STUB_LEN;
-  const vx2 = x2 - STUB_LEN;
-
-  return [
-    { x: x1, y: y1 }, { x: vx1, y: y1 },
-    { x: vx1, y: detourY }, { x: vx2, y: detourY },
-    { x: vx2, y: y2 }, { x: x2, y: y2 },
-  ];
-}
-
-function routeBackward(x1: number, y1: number, x2: number, y2: number, _obs: BlockRect[]): Pt[] {
-  // Route above all blocks via perimeter
-  const allMinY = drawnBlocks.length > 0 ? Math.min(...drawnBlocks.map(b => b.y)) : Math.min(y1, y2);
-  const routeY = Math.round(allMinY - PERIMETER_MARGIN * 2);
-
-  const exitX = x1 + STUB_LEN;
-  const entryX = x2 - STUB_LEN;
-
-  return [
-    { x: x1, y: y1 }, { x: exitX, y: y1 },
-    { x: exitX, y: routeY }, { x: entryX, y: routeY },
-    { x: entryX, y: y2 }, { x: x2, y: y2 },
-  ];
-}
-
-// ─── Segment collision helpers ────────────────────────────────
-
-function hSegHitsBlock(x1: number, x2: number, y: number, obs: BlockRect[]): boolean {
-  const xMin = Math.min(x1, x2), xMax = Math.max(x1, x2);
-  return obs.some(b =>
-    b.x + b.w > xMin + 2 && b.x < xMax - 2 &&
-    y > b.y - BLOCK_ARROW_GAP && y < b.y + b.h + BLOCK_ARROW_GAP
-  );
-}
-
-function vSegHitsBlock(x: number, y1: number, y2: number, obs: BlockRect[]): boolean {
-  const yMin = Math.min(y1, y2), yMax = Math.max(y1, y2);
-  return obs.some(b =>
-    x > b.x - BLOCK_ARROW_GAP && x < b.x + b.w + BLOCK_ARROW_GAP &&
-    yMax > b.y + 2 && yMin < b.y + b.h - 2
-  );
-}
-
-function findClearVChannel(xL: number, xR: number, y1: number, y2: number, obs: BlockRect[]): number {
-  const midX = Math.round((xL + xR) / 2);
-  if (!vSegHitsBlock(midX, y1, y2, obs)) return midX;
-
-  const yMin = Math.min(y1, y2), yMax = Math.max(y1, y2);
-  const inRange = obs.filter(b =>
-    b.x + b.w > Math.min(xL, xR) && b.x < Math.max(xL, xR) &&
-    yMax > b.y - 4 && yMin < b.y + b.h + 4
-  ).sort((a, b) => a.x - b.x);
-
-  const gaps: number[] = [];
-  if (inRange.length > 0 && inRange[0].x > Math.min(xL, xR) + BLOCK_ARROW_GAP * 2)
-    gaps.push(Math.round((Math.min(xL, xR) + inRange[0].x) / 2));
-  for (let i = 0; i < inRange.length - 1; i++) {
-    const right = inRange[i].x + inRange[i].w;
-    const left = inRange[i + 1].x;
-    if (left - right > BLOCK_ARROW_GAP * 2) gaps.push(Math.round((right + left) / 2));
-  }
-  if (inRange.length > 0) {
-    const last = inRange[inRange.length - 1];
-    if (Math.max(xL, xR) - (last.x + last.w) > BLOCK_ARROW_GAP * 2)
-      gaps.push(Math.round((last.x + last.w + Math.max(xL, xR)) / 2));
-  }
-
-  gaps.sort((a, b) => Math.abs(a - midX) - Math.abs(b - midX));
-  for (const g of gaps) { if (!vSegHitsBlock(g, y1, y2, obs)) return g; }
-
-  for (let off = TRACK_SPACING; off < 400; off += TRACK_SPACING) {
-    if (!vSegHitsBlock(midX + off, y1, y2, obs)) return midX + off;
-    if (!vSegHitsBlock(midX - off, y1, y2, obs)) return midX - off;
-  }
-  return midX;
-}
-
-// ─── Track deconfliction ──────────────────────────────────────
-
-interface SegInfo { routeIdx: number; segIdx: number; pos: number; min: number; max: number }
-
-function deconflictTracks(routed: RoutedArrow[]): void {
-  const vSegs: SegInfo[] = [];
-  const hSegs: SegInfo[] = [];
-  for (let ri = 0; ri < routed.length; ri++) {
-    const pts = routed[ri].waypoints;
-    for (let si = 0; si < pts.length - 1; si++) {
-      const dx = Math.abs(pts[si].x - pts[si + 1].x);
-      const dy = Math.abs(pts[si].y - pts[si + 1].y);
-      if (dx < 1 && dy > 4)
-        vSegs.push({ routeIdx: ri, segIdx: si, pos: pts[si].x, min: Math.min(pts[si].y, pts[si + 1].y), max: Math.max(pts[si].y, pts[si + 1].y) });
-      else if (dy < 1 && dx > 4)
-        hSegs.push({ routeIdx: ri, segIdx: si, pos: pts[si].y, min: Math.min(pts[si].x, pts[si + 1].x), max: Math.max(pts[si].x, pts[si + 1].x) });
-    }
-  }
-  spreadOverlapping(vSegs, routed, 'v');
-  spreadOverlapping(hSegs, routed, 'h');
-}
-
-function spreadOverlapping(segs: SegInfo[], routed: RoutedArrow[], axis: 'v' | 'h'): void {
-  if (segs.length <= 1) return;
-  segs.sort((a, b) => a.pos - b.pos);
-  let i = 0;
-  while (i < segs.length) {
-    let j = i + 1;
-    while (j < segs.length && segs[j].pos - segs[i].pos < TRACK_SPACING * 1.5) j++;
-    const group = segs.slice(i, j);
-    if (group.length > 1 && group.some((a, ai) =>
-      group.some((b, bi) => ai !== bi && a.max > b.min && a.min < b.max))) {
-      const center = group.reduce((s, seg) => s + seg.pos, 0) / group.length;
-      group.sort((a, b) => (a.min + a.max) / 2 - (b.min + b.max) / 2);
-      const span = (group.length - 1) * TRACK_SPACING;
-      for (let k = 0; k < group.length; k++) {
-        const newPos = Math.round(center - span / 2 + k * TRACK_SPACING);
-        const pts = routed[group[k].routeIdx].waypoints;
-        const si = group[k].segIdx;
-        if (axis === 'v') { pts[si].x = newPos; pts[si + 1].x = newPos; }
-        else              { pts[si].y = newPos; pts[si + 1].y = newPos; }
+    // Temporarily clear start/end cells if inside block margin
+    const cells: [number, number][] = [];
+    const savedVals: number[] = [];
+    for (const [px, py] of [[stubSX, ra.srcY], [stubTX, ra.tgtY]] as [number, number][]) {
+      const gc = Math.round((px - grid.ox) / GRID);
+      const gr = Math.round((py - grid.oy) / GRID);
+      if (gc >= 0 && gc < grid.cols && gr >= 0 && gr < grid.rows) {
+        cells.push([gc, gr]);
+        savedVals.push(grid.data[gr * grid.cols + gc]);
+        grid.data[gr * grid.cols + gc] = 0;
       }
     }
-    i = j;
+
+    const path = gridRoute(stubSX, ra.srcY, stubTX, ra.tgtY, grid);
+
+    // Restore cleared cells
+    for (let i = 0; i < cells.length; i++)
+      grid.data[cells[i][1] * grid.cols + cells[i][0]] = savedVals[i];
+
+    // Full path: src port → rightward stub → A* path → leftward stub → tgt port
+    const wp: Pt[] = [{ x: ra.srcX, y: ra.srcY }];
+    for (const p of path) {
+      const last = wp[wp.length - 1];
+      if (Math.abs(last.x - p.x) > 1 || Math.abs(last.y - p.y) > 1) wp.push(p);
+    }
+    const tgt = { x: ra.tgtX, y: ra.tgtY };
+    if (Math.abs(wp[wp.length - 1].x - tgt.x) > 1 || Math.abs(wp[wp.length - 1].y - tgt.y) > 1)
+      wp.push(tgt);
+    ra.waypoints = wp;
+
+    // Mark routed path so subsequent routes avoid it
+    markPathOnGrid(path, grid);
   }
+
+  // Draw all arrows and junctions
+  for (const ra of routed) drawArrow(parent, ra);
+  drawJunctions(parent, routed);
 }
 
 // ═══════════════════════════════════════════════════════════════
