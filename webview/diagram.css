@@ -133,10 +133,23 @@ body {
   transition: opacity 0.15s ease, stroke-width 0.15s ease, filter 0.15s ease;
 }
 
-.df-arrow:hover {
+.df-arrow-group { pointer-events: auto; }
+
+.df-arrow-group:hover .df-arrow {
   opacity: 1;
   stroke-width: 3 !important;
   filter: drop-shadow(0 0 3px currentColor);
+}
+
+.df-arrow-group:hover .df-arrow-label {
+  filter: drop-shadow(0 0 4px currentColor);
+  opacity: 1;
+}
+
+.df-arrow-group:hover .df-label-bg {
+  filter: drop-shadow(0 0 4px currentColor);
+  stroke-width: 1.5;
+  opacity: 1;
 }
 
 /* DUT block highlight */

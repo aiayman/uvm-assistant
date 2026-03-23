@@ -1101,9 +1101,13 @@ function drawArrow(parent: SVGGElement, ra: RoutedArrow): void {
     }
   }
 
+  // Wrap entire arrow in a group for unified hover
+  const ag = el('g') as SVGGElement;
+  ag.setAttribute('class', 'df-arrow-group');
+
   // Port circles
-  parent.appendChild(attrs(el('circle'), { cx: pts[0].x, cy: pts[0].y, r: PORT_CIRCLE_R, fill: a.color, stroke: '#1e1e1e', 'stroke-width': 1, class: 'df-port-dot' }));
-  parent.appendChild(attrs(el('circle'), { cx: pts[pts.length - 1].x, cy: pts[pts.length - 1].y, r: PORT_CIRCLE_R, fill: a.color, stroke: '#1e1e1e', 'stroke-width': 1, class: 'df-port-dot' }));
+  ag.appendChild(attrs(el('circle'), { cx: pts[0].x, cy: pts[0].y, r: PORT_CIRCLE_R, fill: a.color, stroke: '#1e1e1e', 'stroke-width': 1, class: 'df-port-dot' }));
+  ag.appendChild(attrs(el('circle'), { cx: pts[pts.length - 1].x, cy: pts[pts.length - 1].y, r: PORT_CIRCLE_R, fill: a.color, stroke: '#1e1e1e', 'stroke-width': 1, class: 'df-port-dot' }));
 
   // Build strictly-orthogonal SVG path (M + L only)
   let d = `M${pts[0].x},${pts[0].y}`;
@@ -1123,7 +1127,7 @@ function drawArrow(parent: SVGGElement, ra: RoutedArrow): void {
     arrowPath.appendChild(title);
     arrowPath.addEventListener('dblclick', () => { vscode.postMessage({ command: 'openFile', filePath: a.filePath, line: a.line }); });
   }
-  parent.appendChild(arrowPath);
+  ag.appendChild(arrowPath);
 
   // Label on longest segment (with collision avoidance)
   if (a.label) {
@@ -1173,12 +1177,13 @@ function drawArrow(parent: SVGGElement, ra: RoutedArrow): void {
     }
     if (segs.length > 0) {
       drawnLabels.push({ x: lx - tw / 2, y: ly - th / 2, w: tw, h: th });
-      parent.appendChild(attrs(el('rect'), { x: lx - tw / 2, y: ly - 7, width: tw, height: th, rx: 3, fill: '#111', opacity: 0.92, stroke: a.color, 'stroke-width': 0.5 }));
+      ag.appendChild(attrs(el('rect'), { x: lx - tw / 2, y: ly - 7, width: tw, height: th, rx: 3, fill: '#111', opacity: 0.92, stroke: a.color, 'stroke-width': 0.5, class: 'df-label-bg' }));
       const lbl = attrs(el('text'), { x: lx, y: ly + 3, 'text-anchor': 'middle', 'font-size': 8, fill: a.color, class: 'df-arrow-label' }) as SVGTextElement;
       lbl.textContent = displayLabel;
-      parent.appendChild(lbl);
+      ag.appendChild(lbl);
     }
   }
+  parent.appendChild(ag);
 }
 
 function drawJunctions(parent: SVGGElement, routed: RoutedArrow[]): void {
