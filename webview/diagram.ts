@@ -386,43 +386,54 @@ function renderProject(roots: UvmDiagramNode[], duts: DutInfo[]): void {
 
   layoutBlocks.sort((a, b) => a.stage - b.stage);
 
-  // ── Column grid with routing channels ──
+  // ── Column grid with routing channels & vertical stacking ──
   const envNode = roots.find(r => r.uvmType === 'test')?.children.find(c => c.uvmType === 'env') || roots.find(r => r.uvmType === 'env');
   const testNode = roots.find(r => r.uvmType === 'test');
   const envHeaderH = envNode ? HEADER_H : 0;
   const testHeaderH = testNode ? HEADER_H : 0;
 
-  let curX = PAD + (testNode ? PAD : 0) + (envNode ? PAD : 0);
+  // Group blocks by stage for vertical stacking within columns
+  const stageGroups = new Map<number, LayoutBlock[]>();
+  for (const block of layoutBlocks) {
+    const s = block.stage < 0 ? 3 : block.stage;
+    if (!stageGroups.has(s)) stageGroups.set(s, []);
+    stageGroups.get(s)!.push(block);
+  }
+  const sortedStages = [...stageGroups.keys()].sort((a, b) => a - b);
+
+  const startX = PAD + (testNode ? PAD : 0) + (envNode ? PAD : 0);
   const baseY = PAD + testHeaderH + envHeaderH;
-  const maxBlockH = Math.max(DUT_H, ...layoutBlocks.map(b => b.h));
 
   const blockPositions: { block: LayoutBlock; x: number; y: number }[] = [];
-  let prevStage = -999;
+  let curX = startX;
 
-  for (const block of layoutBlocks) {
-    // Add routing channel between stage columns
-    if (prevStage >= 0 && block.stage > prevStage) {
-      curX += CHANNEL_MIN_W;
+  for (let si = 0; si < sortedStages.length; si++) {
+    const stage = sortedStages[si];
+    const blocks = stageGroups.get(stage)!;
+    const colW = Math.max(...blocks.map(b => b.w));
+
+    let curY = baseY;
+    for (const block of blocks) {
+      blockPositions.push({ block, x: curX + (colW - block.w) / 2, y: curY });
+      curY += block.h + GAP_Y;
     }
-    const y = baseY + (maxBlockH - block.h) / 2;
-    blockPositions.push({ block, x: curX, y });
-    curX += block.w + GAP_X;
-    prevStage = block.stage;
+
+    curX += colW;
+    if (si < sortedStages.length - 1) curX += GAP_X + CHANNEL_MIN_W;
   }
 
-  const totalInnerW = curX - GAP_X + PAD;
-  const totalInnerH = maxBlockH + PAD * 2;
+  // Compute bounding box of all placed blocks
+  const maxRightX = blockPositions.length > 0 ? Math.max(...blockPositions.map(bp => bp.x + bp.block.w)) : startX;
+  const maxBottomY = blockPositions.length > 0 ? Math.max(...blockPositions.map(bp => bp.y + bp.block.h)) : baseY;
 
   // Draw container boxes
   const envX = PAD + (testNode ? PAD : 0);
   const envY = PAD + testHeaderH;
-  const envW = totalInnerW - (testNode ? PAD : 0);
-  const envH = totalInnerH + envHeaderH;
+  const envW = maxRightX + PAD - envX;
+  const envH = maxBottomY + PAD - envY;
 
   if (testNode) {
-    const testW = totalInnerW + PAD;
-    const testH = envH + testHeaderH + PAD;
-    drawContainerBox(rootG, testNode, PAD, PAD, testW, testH);
+    drawContainerBox(rootG, testNode, PAD, PAD, envX - PAD + envW + PAD, envY - PAD + envH + PAD);
   }
   if (envNode) drawContainerBox(rootG, envNode, envX, envY, envW, envH);
 
@@ -781,10 +792,11 @@ function routeForward(x1: number, y1: number, x2: number, y2: number, obs: Block
   // Horizontal stub out of source
   const stubX = x1 + STUB_LEN;
 
-  if (Math.abs(y1 - y2) < 2) {
-    // Same Y: try direct horizontal
-    if (!hSegHitsBlock(x1, x2, y1, obs)) {
-      return [{ x: x1, y: y1 }, { x: x2, y: y2 }];
+  if (Math.abs(y1 - y2) < 3) {
+    // Nearly same Y: snap and try direct horizontal
+    const snapY = Math.round((y1 + y2) / 2);
+    if (!hSegHitsBlock(x1, x2, snapY, obs)) {
+      return [{ x: x1, y: snapY }, { x: x2, y: snapY }];
     }
   }
 
@@ -795,8 +807,8 @@ function routeForward(x1: number, y1: number, x2: number, y2: number, obs: Block
   if (!hSegHitsBlock(x1, channelX, y1, obs) &&
       !vSegHitsBlock(channelX, y1, y2, obs) &&
       !hSegHitsBlock(channelX, x2, y2, obs)) {
-    if (Math.abs(y1 - y2) < 2) {
-      return [{ x: x1, y: y1 }, { x: x2, y: y2 }];
+    if (Math.abs(y1 - y2) < 3) {
+      return [{ x: x1, y: y1 }, { x: x2, y: y1 }];
     }
     return [{ x: x1, y: y1 }, { x: channelX, y: y1 }, { x: channelX, y: y2 }, { x: x2, y: y2 }];
   }
@@ -953,12 +965,26 @@ function drawArrow(parent: SVGGElement, ra: RoutedArrow): void {
   const { arrow: a, waypoints: pts } = ra;
   if (pts.length < 2) return;
 
-  // Enforce strict orthogonality
-  for (let i = 1; i < pts.length; i++) {
-    const dx = Math.abs(pts[i].x - pts[i - 1].x);
-    const dy = Math.abs(pts[i].y - pts[i - 1].y);
-    if (dx < dy) pts[i].x = pts[i - 1].x;
-    else pts[i].y = pts[i - 1].y;
+  // Enforce strict orthogonality by inserting corners for any diagonal segments
+  {
+    const clean: Pt[] = [{ x: pts[0].x, y: pts[0].y }];
+    for (let i = 1; i < pts.length; i++) {
+      const prev = clean[clean.length - 1];
+      const cur = pts[i];
+      if (Math.abs(prev.x - cur.x) > 1 && Math.abs(prev.y - cur.y) > 1) {
+        clean.push({ x: cur.x, y: prev.y });
+      }
+      clean.push({ x: cur.x, y: cur.y });
+    }
+    const final: Pt[] = [clean[0]];
+    for (let i = 1; i < clean.length - 1; i++) {
+      const p = final[final.length - 1], c = clean[i], n = clean[i + 1];
+      if (!(Math.abs(p.x - c.x) < 1 && Math.abs(c.x - n.x) < 1) &&
+          !(Math.abs(p.y - c.y) < 1 && Math.abs(c.y - n.y) < 1)) final.push(c);
+    }
+    final.push(clean[clean.length - 1]);
+    pts.length = 0;
+    pts.push(...final);
   }
 
   // Ensure last segment is long enough for arrowhead
@@ -996,22 +1022,43 @@ function drawArrow(parent: SVGGElement, ra: RoutedArrow): void {
   }
   parent.appendChild(arrowPath);
 
-  // Label on longest segment
+  // Label on longest segment (with collision avoidance)
   if (a.label) {
-    let bestLen = 0, bestMx = 0, bestMy = 0, isVert = false;
-    for (let i = 0; i < pts.length - 1; i++) {
-      const dx = pts[i + 1].x - pts[i].x, dy = pts[i + 1].y - pts[i].y;
-      const len = Math.abs(dx) + Math.abs(dy);
-      if (len > bestLen) { bestLen = len; bestMx = (pts[i].x + pts[i + 1].x) / 2; bestMy = (pts[i].y + pts[i + 1].y) / 2; isVert = Math.abs(dy) > Math.abs(dx); }
-    }
     const displayLabel = a.label.length > 20 ? a.label.slice(0, 18) + '..' : a.label;
     const tw = displayLabel.length * 5 + 10;
-    const lx = isVert ? bestMx + 6 : bestMx;
-    const ly = isVert ? bestMy : bestMy - 12;
-    parent.appendChild(attrs(el('rect'), { x: lx - tw / 2, y: ly - 7, width: tw, height: 14, rx: 3, fill: '#111', opacity: 0.92, stroke: a.color, 'stroke-width': 0.5 }));
-    const lbl = attrs(el('text'), { x: lx, y: ly + 3, 'text-anchor': 'middle', 'font-size': 8, fill: a.color, class: 'df-arrow-label' }) as SVGTextElement;
-    lbl.textContent = displayLabel;
-    parent.appendChild(lbl);
+    const th = 14;
+
+    // Collect segments sorted by length (longest first)
+    const segs: { mx: number; my: number; len: number; isVert: boolean }[] = [];
+    for (let i = 0; i < pts.length - 1; i++) {
+      const sdx = pts[i + 1].x - pts[i].x, sdy = pts[i + 1].y - pts[i].y;
+      const len = Math.abs(sdx) + Math.abs(sdy);
+      if (len > 10) segs.push({ mx: (pts[i].x + pts[i + 1].x) / 2, my: (pts[i].y + pts[i + 1].y) / 2, len, isVert: Math.abs(sdy) > Math.abs(sdx) });
+    }
+    segs.sort((s1, s2) => s2.len - s1.len);
+
+    let lx = 0, ly = 0, placed = false;
+    for (const seg of segs) {
+      const cx = seg.isVert ? seg.mx + tw / 2 + 6 : seg.mx;
+      const cy = seg.isVert ? seg.my : seg.my - 12;
+      const lLeft = cx - tw / 2, lTop = cy - th / 2;
+      const overlaps = drawnBlocks.some(b =>
+        lLeft < b.x + b.w + 4 && lLeft + tw > b.x - 4 &&
+        lTop < b.y + b.h + 4 && lTop + th > b.y - 4
+      );
+      if (!overlaps) { lx = cx; ly = cy; placed = true; break; }
+    }
+    if (!placed && segs.length > 0) {
+      const seg = segs[0];
+      lx = seg.isVert ? seg.mx + tw / 2 + 8 : seg.mx;
+      ly = seg.isVert ? seg.my : seg.my - th - 4;
+    }
+    if (segs.length > 0) {
+      parent.appendChild(attrs(el('rect'), { x: lx - tw / 2, y: ly - 7, width: tw, height: th, rx: 3, fill: '#111', opacity: 0.92, stroke: a.color, 'stroke-width': 0.5 }));
+      const lbl = attrs(el('text'), { x: lx, y: ly + 3, 'text-anchor': 'middle', 'font-size': 8, fill: a.color, class: 'df-arrow-label' }) as SVGTextElement;
+      lbl.textContent = displayLabel;
+      parent.appendChild(lbl);
+    }
   }
 }
 
