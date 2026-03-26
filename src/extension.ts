@@ -7,6 +7,7 @@ import { UvmDiagramPanel, SerializedProject, serializeUvmTree } from './views/uv
 import { runUvmLinter, toVscodeSeverity } from './linter/uvmLinter';
 import { VeribleFormattingProvider } from './formatter/veribleFormatter';
 import { TestbenchProject, UvmNode, DutInfo } from './models/uvmNode';
+import { loadOverrides } from './overrideManager';
 
 let fileScanner: FileScanner;
 let svParser: SvParser;
@@ -71,7 +72,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
       }
       const projects = buildProjectList(lastResult);
-      UvmDiagramPanel.createOrShow(extensionUri, projects, 'dataflow');
+      const overrides = await loadOverrides();
+      UvmDiagramPanel.createOrShow(extensionUri, projects, 'dataflow', overrides);
     }),
     vscode.commands.registerCommand('uvm-assistant.formatDocument', async () => {
       const editor = vscode.window.activeTextEditor;

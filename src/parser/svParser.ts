@@ -285,6 +285,13 @@ function buildUvmHierarchy(allClasses: Map<string, UvmClassInfo>): UvmNode[] {
 /**
  * Detect DUT modules by finding modules instantiated in testbench top modules.
  * A testbench top is identified by containing a `run_test()` call.
+ *
+ * Strategy:
+ *  1. Primary: instances of tb_top modules that are known parsed modules
+ *     (filters out interfaces/primitives not in allModules).
+ *  2. Fallback: if no DUTs found, look for "companion top" modules —
+ *     top-level modules in the same file set that aren't tb_tops but
+ *     instantiate real modules (handles split top/testbench patterns).
  */
 function detectDuts(allModules: Map<string, ModuleNode>, fileTexts: Map<string, string>): DutInfo[] {
   // Find testbench top files (files containing run_test())
@@ -303,26 +310,48 @@ function detectDuts(allModules: Map<string, ModuleNode>, fileTexts: Map<string, 
     }
   }
 
-  // DUTs are modules instantiated by testbench top modules
+  // Helper: collect DUT candidates from a module's instances
   const duts: DutInfo[] = [];
   const seen = new Set<string>();
-  for (const tbName of tbTopModules) {
-    const tb = allModules.get(tbName);
-    if (!tb) continue;
-    for (const inst of tb.instances) {
-      // Skip if it's another testbench top or already seen
+  const collectDutsFrom = (mod: ModuleNode) => {
+    for (const inst of mod.instances) {
       if (tbTopModules.has(inst.moduleName) || seen.has(inst.moduleName)) continue;
+      // Only treat as DUT if it's a known parsed module (not an interface/primitive)
+      if (!allModules.has(inst.moduleName)) continue;
       seen.add(inst.moduleName);
-
-      const mod = allModules.get(inst.moduleName);
+      const dutMod = allModules.get(inst.moduleName)!;
       duts.push({
         moduleName: inst.moduleName,
         instanceName: inst.instanceName,
-        filePath: mod?.filePath ?? inst.filePath,
-        line: mod?.line ?? inst.line,
+        filePath: dutMod.filePath,
+        line: dutMod.line,
       });
     }
+  };
+
+  // Primary: check tb_top module instances
+  for (const tbName of tbTopModules) {
+    const tb = allModules.get(tbName);
+    if (tb) collectDutsFrom(tb);
   }
+
+  // Fallback: if no DUTs found, look for companion top-level modules
+  if (duts.length === 0 && tbTopModules.size > 0) {
+    // Build set of modules instantiated by any other module
+    const instantiated = new Set<string>();
+    for (const mod of allModules.values()) {
+      for (const inst of mod.instances) {
+        instantiated.add(inst.moduleName);
+      }
+    }
+    // Companion tops: top-level modules that aren't tb_tops
+    for (const mod of allModules.values()) {
+      if (tbTopModules.has(mod.name)) continue;
+      if (instantiated.has(mod.name)) continue;
+      collectDutsFrom(mod);
+    }
+  }
+
   return duts;
 }
 

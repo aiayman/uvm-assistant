@@ -115,6 +115,24 @@ let drawnLabels: { x: number; y: number; w: number; h: number }[] = [];
 let allProjects: ProjectData[] = [];
 let selectedProjectIndex = 0;
 
+// ─── Override / Mapping table types ──────────────────────────
+interface ComponentOverride { name: string; role: string; filePath: string; line?: number; instanceName?: string; }
+interface ConnectionOverride { from: string; to: string; label?: string; }
+interface OverrideConfig {
+  addedComponents?: ComponentOverride[];
+  removedComponents?: string[];
+  roleOverrides?: Record<string, string>;
+  addedConnections?: ConnectionOverride[];
+  removedConnections?: ConnectionOverride[];
+}
+interface MappingComponent { name: string; role: string; filePath: string; line: number; source: 'auto' | 'override'; }
+interface MappingConnection { from: string; to: string; label: string; type: string; source: 'auto' | 'override'; }
+
+let currentOverrides: OverrideConfig = {};
+let mappingComponents: MappingComponent[] = [];
+let mappingConnections: MappingConnection[] = [];
+let mappingPanelVisible = false;
+
 // ─── SVG helpers ──────────────────────────────────────────────
 const NS = 'http://www.w3.org/2000/svg';
 function el(tag: string): SVGElement { return document.createElementNS(NS, tag); }
@@ -149,15 +167,13 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-zoom-in')?.addEventListener('click', () => zoom(1.2));
   document.getElementById('btn-zoom-out')?.addEventListener('click', () => zoom(0.8));
   document.getElementById('btn-reset')?.addEventListener('click', resetView);
+  document.getElementById('btn-mapping')?.addEventListener('click', toggleMappingPanel);
 
   const dropdown = document.getElementById('project-dropdown') as HTMLSelectElement | null;
   if (dropdown) {
     dropdown.addEventListener('change', () => {
       selectedProjectIndex = dropdown.selectedIndex;
-      if (allProjects[selectedProjectIndex]) {
-        const p = allProjects[selectedProjectIndex];
-        renderProject(p.roots, p.duts);
-      }
+      refreshWithOverrides();
     });
   }
 
@@ -168,14 +184,17 @@ window.addEventListener('message', (ev) => {
   if (ev.data.command === 'renderDiagram') {
     const projects: ProjectData[] = ev.data.projects || [];
     allProjects = projects;
+    currentOverrides = ev.data.overrides || {};
     selectedProjectIndex = 0;
     updateProjectDropdown();
     if (projects.length > 0) {
-      const p = projects[selectedProjectIndex];
-      renderProject(p.roots, p.duts);
+      refreshWithOverrides();
     } else {
       renderProject([], []);
     }
+  } else if (ev.data.command === 'overridesUpdated') {
+    currentOverrides = ev.data.overrides || {};
+    refreshWithOverrides();
   }
 });
 
@@ -306,7 +325,7 @@ function agentRows(members: UvmDiagramNode[]): { row1: UvmDiagramNode[]; row2: U
   return { row1: seqDrv, row2: other };
 }
 
-function renderProject(roots: UvmDiagramNode[], duts: DutInfo[]): void {
+function renderProject(roots: UvmDiagramNode[], duts: DutInfo[], connOverrides?: OverrideConfig): void {
   const empty = document.getElementById('empty-state')!;
   const ctr = document.getElementById('diagram-container')!;
   if (roots.length === 0) { empty.style.display = 'flex'; ctr.style.display = 'none'; clearLegend(); return; }
@@ -482,7 +501,7 @@ function renderProject(roots: UvmDiagramNode[], duts: DutInfo[]): void {
   }
 
   // Phase 2: Route and draw connections
-  drawAllConnections(rootG, roots);
+  drawAllConnections(rootG, roots, connOverrides);
 
   drawLegendOverlay();
   resetView();
@@ -646,7 +665,7 @@ function drawPorts(g: SVGGElement, node: UvmDiagramNode, w: number, h: number, t
 // ═ PHASE 2: ROUTING
 // ═══════════════════════════════════════════════════════════════
 
-function drawAllConnections(parent: SVGGElement, roots: UvmDiagramNode[]): void {
+function drawAllConnections(parent: SVGGElement, roots: UvmDiagramNode[], connOverrides?: OverrideConfig): void {
   const arrows: Arrow[] = [];
 
   // 1. Explicit TLM connections from connect_phase
@@ -731,6 +750,26 @@ function drawAllConnections(parent: SVGGElement, roots: UvmDiagramNode[]): void 
         const monBlocks = drawnBlocks.filter(b => b.node.uvmType === 'monitor' && b.node.tlmPorts.some(p => p.kind.includes('analysis')));
         for (const mon of monBlocks)
           arrows.push({ from: mon, to: sb, label: 'analysis_port', color: '#d16969', marker: 'ah-ap', dashed: false, filePath: mon.node.filePath, line: mon.node.line });
+      }
+    }
+  }
+
+  // 5. Apply connection overrides
+  if (connOverrides) {
+    // Remove overridden connections
+    const removed = connOverrides.removedConnections || [];
+    for (let i = arrows.length - 1; i >= 0; i--) {
+      const a = arrows[i];
+      const fromName = a.from.node.className || '';
+      const toName = a.to.node.className || '';
+      if (removed.some(r => r.from === fromName && r.to === toName)) arrows.splice(i, 1);
+    }
+    // Add user connections
+    for (const ac of connOverrides.addedConnections || []) {
+      const srcBlock = drawnBlocks.find(b => b.node.className === ac.from);
+      const dstBlock = drawnBlocks.find(b => b.node.className === ac.to);
+      if (srcBlock && dstBlock) {
+        arrows.push({ from: srcBlock, to: dstBlock, label: ac.label || '', color: '#8888cc', marker: 'ah', dashed: false });
       }
     }
   }
@@ -1332,6 +1371,366 @@ function drawLegendOverlay(): void {
     html += `<div class="legend-item"><span class="legend-conn-svg">${arrowSvg}</span><span>${c.label}</span></div>`;
   }
   container.innerHTML = html;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ═ MAPPING TABLE
+// ═══════════════════════════════════════════════════════════════
+
+const VALID_ROLES = ['test', 'env', 'agent', 'driver', 'monitor', 'sequencer', 'scoreboard', 'sequence', 'dut', 'component'];
+
+function buildComponentList(roots: UvmDiagramNode[], duts: DutInfo[]): MappingComponent[] {
+  const components: MappingComponent[] = [];
+  const walk = (n: UvmDiagramNode) => {
+    if (STAGE[n.uvmType] !== undefined) {
+      components.push({ name: n.className, role: n.uvmType, filePath: n.filePath, line: n.line, source: 'auto' });
+    }
+    for (const ch of n.children) walk(ch);
+  };
+  for (const r of roots) walk(r);
+  for (const d of duts) {
+    components.push({ name: d.moduleName, role: 'dut', filePath: d.filePath, line: d.line, source: 'auto' });
+  }
+  return components;
+}
+
+function buildConnectionList(roots: UvmDiagramNode[], duts: DutInfo[]): MappingConnection[] {
+  const conns: MappingConnection[] = [];
+  const seen = new Set<string>();
+  const add = (c: MappingConnection) => {
+    const key = `${c.from}>${c.to}>${c.label}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    conns.push(c);
+  };
+
+  // Resolve a field name in a parent node to its class type
+  const resolve = (parent: UvmDiagramNode, fieldName: string): string | undefined => {
+    if (fieldName === 'this') return parent.className;
+    const field = parent.fields.find(f => f.fieldName === fieldName);
+    return field?.typeName;
+  };
+
+  // 1. Explicit TLM connections
+  const walkConns = (node: UvmDiagramNode) => {
+    for (const conn of node.connections) {
+      const fromParts = conn.from.split('.');
+      const toParts = conn.to.split('.');
+      const srcClass = resolve(node, fromParts[0]);
+      const dstClass = resolve(node, toParts[0]);
+      if (!srcClass || !dstClass || srcClass === dstClass) continue;
+      const portName = fromParts.length > 1 ? fromParts[fromParts.length - 1] : '';
+      const isSeq = portName.includes('seq_item') || conn.to.includes('seq_item');
+      const isAp = portName.includes('analysis') || conn.to.includes('analysis') || portName.includes('_ap') || conn.to.includes('_fifo');
+      const label = isSeq ? 'seq_item_port' : isAp ? 'analysis_port' : (portName || 'connect');
+      add({ from: srcClass, to: dstClass, label, type: 'tlm', source: 'auto' });
+    }
+    for (const ch of node.children) walkConns(ch);
+  };
+  for (const r of roots) walkConns(r);
+
+  // 2. Inferred driver ↔ sequencer
+  const walkAgents = (node: UvmDiagramNode) => {
+    if (node.uvmType === 'agent') {
+      const drv = node.children.find(c => c.uvmType === 'driver');
+      const seqr = node.children.find(c => c.uvmType === 'sequencer');
+      if (drv && seqr && !conns.some(c => (c.from === seqr.className && c.to === drv.className) || (c.from === drv.className && c.to === seqr.className)))
+        add({ from: seqr.className, to: drv.className, label: 'seq_item_port', type: 'inferred', source: 'auto' });
+    }
+    for (const ch of node.children) walkAgents(ch);
+  };
+  for (const r of roots) walkAgents(r);
+
+  // 3. Driver → DUT, DUT → Monitor
+  if (duts.length > 0) {
+    const dutName = duts[0].moduleName;
+    const walkDrvMon = (n: UvmDiagramNode, agent?: UvmDiagramNode) => {
+      if (n.uvmType === 'driver' || n.uvmType === 'monitor') {
+        let vif = n.virtualIfs[0] || '';
+        if (!vif && agent) { for (const ch of agent.children) { if (ch.virtualIfs.length > 0) { vif = ch.virtualIfs[0]; break; } } }
+        const label = vif || 'vif';
+        if (n.uvmType === 'driver') add({ from: n.className, to: dutName, label, type: 'virtual_if', source: 'auto' });
+        else add({ from: dutName, to: n.className, label, type: 'virtual_if', source: 'auto' });
+      }
+      for (const ch of n.children) walkDrvMon(ch, n.uvmType === 'agent' ? n : agent);
+    };
+    for (const r of roots) walkDrvMon(r);
+  }
+
+  // 4. Monitor/Agent → Scoreboard (inferred if no explicit TLM)
+  const scoreboards: string[] = [];
+  const apSources: string[] = [];
+  const walkSb = (n: UvmDiagramNode) => {
+    if (n.uvmType === 'scoreboard') scoreboards.push(n.className);
+    if ((n.uvmType === 'monitor' || n.uvmType === 'agent') && n.tlmPorts.some(p => p.kind.includes('analysis'))) apSources.push(n.className);
+    for (const ch of n.children) walkSb(ch);
+  };
+  for (const r of roots) walkSb(r);
+  for (const sb of scoreboards) {
+    if (!conns.some(c => c.to === sb)) {
+      for (const src of apSources)
+        add({ from: src, to: sb, label: 'analysis_port', type: 'inferred', source: 'auto' });
+    }
+  }
+
+  return conns;
+}
+
+function applyComponentOverrides(components: MappingComponent[], ov: OverrideConfig): MappingComponent[] {
+  let result = components.filter(c => !(ov.removedComponents || []).includes(c.name));
+  // Apply role overrides
+  if (ov.roleOverrides) {
+    result = result.map(c => ov.roleOverrides![c.name] ? { ...c, role: ov.roleOverrides![c.name], source: 'override' as const } : c);
+  }
+  // Add user-added components
+  for (const ac of ov.addedComponents || []) {
+    if (!result.some(c => c.name === ac.name))
+      result.push({ name: ac.name, role: ac.role, filePath: ac.filePath, line: ac.line || 0, source: 'override' });
+  }
+  return result;
+}
+
+function applyConnectionOverrides(connections: MappingConnection[], ov: OverrideConfig): MappingConnection[] {
+  let result = connections.filter(c => {
+    return !(ov.removedConnections || []).some(rc => rc.from === c.from && rc.to === c.to);
+  });
+  for (const ac of ov.addedConnections || []) {
+    if (!result.some(c => c.from === ac.from && c.to === ac.to && c.label === (ac.label || '')))
+      result.push({ from: ac.from, to: ac.to, label: ac.label || '', type: 'manual', source: 'override' });
+  }
+  return result;
+}
+
+/** Apply overrides to the project data for diagram rendering */
+function getEffectiveData(proj: ProjectData, ov: OverrideConfig): { roots: UvmDiagramNode[]; duts: DutInfo[] } {
+  const removedSet = new Set(ov.removedComponents || []);
+  // Deep-clone roots, filtering out removed and applying role overrides
+  const cloneNode = (n: UvmDiagramNode): UvmDiagramNode | null => {
+    if (removedSet.has(n.className)) return null;
+    const role = ov.roleOverrides?.[n.className] || n.uvmType;
+    const children = n.children.map(cloneNode).filter((c): c is UvmDiagramNode => c !== null);
+    return { ...n, uvmType: role, children };
+  };
+  const roots = proj.roots.map(cloneNode).filter((r): r is UvmDiagramNode => r !== null);
+
+  // Effective DUT list: original minus removed, plus added DUTs
+  let duts = proj.duts.filter(d => !removedSet.has(d.moduleName));
+  // Any role-overridden-to-dut components? Not needed — DUTs are separate
+  // Add user DUTs
+  for (const ac of ov.addedComponents || []) {
+    if (ac.role === 'dut' && !duts.some(d => d.moduleName === ac.name)) {
+      duts.push({ moduleName: ac.name, instanceName: ac.instanceName || ac.name, filePath: ac.filePath, line: ac.line || 0 });
+    }
+  }
+  return { roots, duts };
+}
+
+function shortPath(filePath: string): string {
+  const parts = filePath.replace(/\\/g, '/').split('/');
+  return parts.length > 2 ? parts.slice(-2).join('/') : parts.join('/');
+}
+
+function renderMappingPanel(): void {
+  const panel = document.getElementById('mapping-panel');
+  if (!panel) return;
+
+  let html = '<div class="mapping-header"><span>Component Mapping</span></div>';
+  html += '<table class="mapping-table"><thead><tr><th>Role</th><th>Name</th><th>File</th><th>Src</th><th></th></tr></thead><tbody>';
+  for (let i = 0; i < mappingComponents.length; i++) {
+    const c = mappingComponents[i];
+    const roleColor = THEMES[c.role]?.stroke || '#888';
+    html += `<tr class="mapping-row" data-idx="${i}">`;
+    html += `<td><select class="mapping-role-sel" data-idx="${i}" style="color:${roleColor}">`;
+    for (const r of VALID_ROLES) {
+      html += `<option value="${r}"${r === c.role ? ' selected' : ''}>${r}</option>`;
+    }
+    html += '</select></td>';
+    html += `<td class="mapping-name">${esc(c.name)}</td>`;
+    html += `<td class="mapping-file" title="${esc(c.filePath)}">${esc(shortPath(c.filePath))}:${c.line}</td>`;
+    html += `<td class="mapping-src">${c.source === 'override' ? 'usr' : 'auto'}</td>`;
+    html += `<td><button class="mapping-del-btn" data-type="comp" data-idx="${i}" title="Remove">&times;</button></td>`;
+    html += '</tr>';
+  }
+  html += '</tbody></table>';
+  html += '<div class="mapping-actions"><button id="btn-add-comp">+ Add Component</button></div>';
+
+  html += '<div class="mapping-header" style="margin-top:12px"><span>Connection Mapping</span></div>';
+  html += '<table class="mapping-table"><thead><tr><th>From</th><th>To</th><th>Label</th><th>Type</th><th>Src</th><th></th></tr></thead><tbody>';
+  for (let i = 0; i < mappingConnections.length; i++) {
+    const c = mappingConnections[i];
+    html += `<tr class="mapping-row">`;
+    html += `<td class="mapping-name">${esc(c.from)}</td>`;
+    html += `<td class="mapping-name">${esc(c.to)}</td>`;
+    html += `<td>${esc(c.label)}</td>`;
+    html += `<td class="mapping-src">${c.type}</td>`;
+    html += `<td class="mapping-src">${c.source === 'override' ? 'usr' : 'auto'}</td>`;
+    html += `<td><button class="mapping-del-btn" data-type="conn" data-idx="${i}" title="Remove">&times;</button></td>`;
+    html += '</tr>';
+  }
+  html += '</tbody></table>';
+  html += '<div class="mapping-actions"><button id="btn-add-conn">+ Add Connection</button></div>';
+
+  panel.innerHTML = html;
+  attachMappingHandlers();
+}
+
+function esc(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function attachMappingHandlers(): void {
+  // Role reclassify
+  document.querySelectorAll('.mapping-role-sel').forEach(sel => {
+    sel.addEventListener('change', (e) => {
+      const target = e.target as HTMLSelectElement;
+      const idx = parseInt(target.dataset.idx || '0', 10);
+      const comp = mappingComponents[idx];
+      if (!comp) return;
+      const newRole = target.value;
+      if (comp.source === 'auto') {
+        // Store as a role override
+        if (!currentOverrides.roleOverrides) currentOverrides.roleOverrides = {};
+        currentOverrides.roleOverrides[comp.name] = newRole;
+      } else {
+        // Update the added component's role
+        const ac = (currentOverrides.addedComponents || []).find(a => a.name === comp.name);
+        if (ac) ac.role = newRole;
+      }
+      saveAndRefresh();
+    });
+  });
+
+  // Delete buttons
+  document.querySelectorAll('.mapping-del-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      const target = e.currentTarget as HTMLElement;
+      const type = target.dataset.type;
+      const idx = parseInt(target.dataset.idx || '0', 10);
+      if (type === 'comp') {
+        const comp = mappingComponents[idx];
+        if (!comp) return;
+        if (comp.source === 'override') {
+          // Remove from addedComponents
+          currentOverrides.addedComponents = (currentOverrides.addedComponents || []).filter(a => a.name !== comp.name);
+        } else {
+          // Add to removedComponents
+          if (!currentOverrides.removedComponents) currentOverrides.removedComponents = [];
+          if (!currentOverrides.removedComponents.includes(comp.name)) currentOverrides.removedComponents.push(comp.name);
+        }
+      } else if (type === 'conn') {
+        const conn = mappingConnections[idx];
+        if (!conn) return;
+        if (conn.source === 'override') {
+          currentOverrides.addedConnections = (currentOverrides.addedConnections || []).filter(a => !(a.from === conn.from && a.to === conn.to));
+        } else {
+          if (!currentOverrides.removedConnections) currentOverrides.removedConnections = [];
+          currentOverrides.removedConnections.push({ from: conn.from, to: conn.to });
+        }
+      }
+      saveAndRefresh();
+    });
+  });
+
+  // Add component button
+  document.getElementById('btn-add-comp')?.addEventListener('click', () => showAddComponentDialog());
+  // Add connection button
+  document.getElementById('btn-add-conn')?.addEventListener('click', () => showAddConnectionDialog());
+}
+
+function showAddComponentDialog(): void {
+  const panel = document.getElementById('mapping-panel');
+  if (!panel) return;
+  // Check if dialog already open
+  if (panel.querySelector('.mapping-dialog')) return;
+
+  const dialog = document.createElement('div');
+  dialog.className = 'mapping-dialog';
+  dialog.innerHTML = `
+    <div class="mapping-dialog-title">Add Component</div>
+    <label>Name: <input type="text" id="dlg-comp-name" placeholder="e.g. my_dut" /></label>
+    <label>Role: <select id="dlg-comp-role">${VALID_ROLES.map(r => `<option value="${r}">${r}</option>`).join('')}</select></label>
+    <label>File Path: <input type="text" id="dlg-comp-file" placeholder="path/to/file.sv" /></label>
+    <label>Line: <input type="number" id="dlg-comp-line" value="1" min="1" /></label>
+    <div class="mapping-dialog-btns">
+      <button id="dlg-comp-ok">Add</button>
+      <button id="dlg-comp-cancel">Cancel</button>
+    </div>`;
+  panel.appendChild(dialog);
+
+  document.getElementById('dlg-comp-cancel')?.addEventListener('click', () => dialog.remove());
+  document.getElementById('dlg-comp-ok')?.addEventListener('click', () => {
+    const name = (document.getElementById('dlg-comp-name') as HTMLInputElement).value.trim();
+    const role = (document.getElementById('dlg-comp-role') as HTMLSelectElement).value;
+    const filePath = (document.getElementById('dlg-comp-file') as HTMLInputElement).value.trim();
+    const line = parseInt((document.getElementById('dlg-comp-line') as HTMLInputElement).value, 10) || 1;
+    if (!name) return;
+    if (!currentOverrides.addedComponents) currentOverrides.addedComponents = [];
+    currentOverrides.addedComponents.push({ name, role, filePath: filePath || '', line, instanceName: role === 'dut' ? name : undefined });
+    dialog.remove();
+    saveAndRefresh();
+  });
+}
+
+function showAddConnectionDialog(): void {
+  const panel = document.getElementById('mapping-panel');
+  if (!panel) return;
+  if (panel.querySelector('.mapping-dialog')) return;
+
+  const names = mappingComponents.map(c => c.name);
+  const opts = names.map(n => `<option value="${n}">${n}</option>`).join('');
+
+  const dialog = document.createElement('div');
+  dialog.className = 'mapping-dialog';
+  dialog.innerHTML = `
+    <div class="mapping-dialog-title">Add Connection</div>
+    <label>From: <select id="dlg-conn-from">${opts}</select></label>
+    <label>To: <select id="dlg-conn-to">${opts}</select></label>
+    <label>Label: <input type="text" id="dlg-conn-label" placeholder="e.g. analysis_port" /></label>
+    <div class="mapping-dialog-btns">
+      <button id="dlg-conn-ok">Add</button>
+      <button id="dlg-conn-cancel">Cancel</button>
+    </div>`;
+  panel.appendChild(dialog);
+
+  document.getElementById('dlg-conn-cancel')?.addEventListener('click', () => dialog.remove());
+  document.getElementById('dlg-conn-ok')?.addEventListener('click', () => {
+    const from = (document.getElementById('dlg-conn-from') as HTMLSelectElement).value;
+    const to = (document.getElementById('dlg-conn-to') as HTMLSelectElement).value;
+    const label = (document.getElementById('dlg-conn-label') as HTMLInputElement).value.trim();
+    if (!from || !to || from === to) return;
+    if (!currentOverrides.addedConnections) currentOverrides.addedConnections = [];
+    currentOverrides.addedConnections.push({ from, to, label });
+    dialog.remove();
+    saveAndRefresh();
+  });
+}
+
+function saveAndRefresh(): void {
+  vscode.postMessage({ command: 'saveOverrides', overrides: currentOverrides });
+  refreshWithOverrides();
+}
+
+function refreshWithOverrides(): void {
+  const proj = allProjects[selectedProjectIndex];
+  if (!proj) return;
+  // Rebuild mapping data
+  const rawComponents = buildComponentList(proj.roots, proj.duts);
+  const rawConnections = buildConnectionList(proj.roots, proj.duts);
+  mappingComponents = applyComponentOverrides(rawComponents, currentOverrides);
+  mappingConnections = applyConnectionOverrides(rawConnections, currentOverrides);
+  // Re-render diagram with overrides applied
+  const eff = getEffectiveData(proj, currentOverrides);
+  renderProject(eff.roots, eff.duts, currentOverrides);
+  // Re-render mapping table
+  if (mappingPanelVisible) renderMappingPanel();
+}
+
+function toggleMappingPanel(): void {
+  const panel = document.getElementById('mapping-panel');
+  if (!panel) return;
+  mappingPanelVisible = !mappingPanelVisible;
+  panel.style.display = mappingPanelVisible ? 'block' : 'none';
+  if (mappingPanelVisible) renderMappingPanel();
 }
 
 function clearLegend(): void {

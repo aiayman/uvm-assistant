@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 import * as crypto from 'crypto';
 import { UvmNode, TlmPort, TlmConnection, DutInfo, TestbenchProject } from '../models/uvmNode';
+import { OverrideConfig } from '../models/overrides';
+import { saveOverrides } from '../overrideManager';
 
 export type DiagramMode = 'block' | 'dataflow';
 
@@ -21,7 +23,7 @@ export class UvmDiagramPanel {
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
 
     this.panel.webview.onDidReceiveMessage(
-      (msg) => {
+      async (msg) => {
         if (msg.command === 'ready') {
           this.flushPendingData();
         } else if (msg.command === 'openFile' && msg.filePath && msg.line) {
@@ -30,6 +32,10 @@ export class UvmDiagramPanel {
           vscode.window.showTextDocument(uri, {
             selection: new vscode.Range(line, 0, line, 0),
           });
+        } else if (msg.command === 'saveOverrides' && msg.overrides) {
+          await saveOverrides(msg.overrides as OverrideConfig);
+          // Echo back the saved overrides so the webview can re-apply
+          this.panel.webview.postMessage({ command: 'overridesUpdated', overrides: msg.overrides });
         }
       },
       null,
@@ -41,13 +47,14 @@ export class UvmDiagramPanel {
     extensionUri: vscode.Uri,
     projects: SerializedProject[],
     mode: DiagramMode = 'block',
+    overrides: OverrideConfig = {},
   ): void {
     const column = vscode.window.activeTextEditor?.viewColumn ?? vscode.ViewColumn.One;
     const existing = UvmDiagramPanel.panels.get(mode);
 
     if (existing) {
       existing.panel.reveal(column);
-      existing.updateDiagram(projects);
+      existing.updateDiagram(projects, overrides);
       return;
     }
 
@@ -70,11 +77,11 @@ export class UvmDiagramPanel {
 
     const instance = new UvmDiagramPanel(panel, extensionUri, mode);
     UvmDiagramPanel.panels.set(mode, instance);
-    instance.updateDiagram(projects);
+    instance.updateDiagram(projects, overrides);
   }
 
-  updateDiagram(projects: SerializedProject[]): void {
-    this.pendingData = { projects };
+  updateDiagram(projects: SerializedProject[], overrides: OverrideConfig = {}): void {
+    this.pendingData = { projects, overrides };
     this.panel.webview.html = this.getHtml(this.panel.webview);
   }
 
@@ -83,6 +90,7 @@ export class UvmDiagramPanel {
       this.panel.webview.postMessage({
         command: 'renderDiagram',
         projects: this.pendingData.projects,
+        overrides: this.pendingData.overrides,
       });
       this.pendingData = undefined;
     }
@@ -121,11 +129,14 @@ export class UvmDiagramPanel {
     <button id="btn-zoom-in" title="Zoom In">+</button>
     <button id="btn-zoom-out" title="Zoom Out">&minus;</button>
     <button id="btn-reset" title="Reset View">&odot;</button>
+    <span class="toolbar-sep"></span>
+    <button id="btn-mapping" title="Toggle Mapping Table">&#9776; Mapping</button>
   </div>
   <div id="diagram-container">
     <svg id="diagram"></svg>
   </div>
   <div id="legend-overlay"></div>
+  <div id="mapping-panel" style="display:none;"></div>
   <div id="empty-state" style="display:none;">
     <p>No UVM components found in the workspace.</p>
     <p>Open a folder containing SystemVerilog files with UVM classes and click Refresh.</p>
@@ -151,6 +162,7 @@ export interface SerializedProject {
 
 interface DiagramPayload {
   projects: SerializedProject[];
+  overrides: OverrideConfig;
 }
 
 interface SerializedField {
