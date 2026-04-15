@@ -62,6 +62,12 @@ export class SvParser {
       }
     }
 
+    // Resolve user-derived class types globally BEFORE per-project hierarchies
+    // so that a base class in a shared dir still propagates its type to a
+    // subclass in another dir. E.g. `class my_mon extends uvm_monitor` in lib/
+    // lets `class axi_mon extends my_mon` in proj/ classify as 'monitor'.
+    resolveUvmTypesTransitively(allUvmClasses);
+
     const moduleRoots = buildModuleHierarchy(allModules);
     const uvmRoots = buildUvmHierarchy(allUvmClasses);
     const duts = detectDuts(allModules, fileTexts);
@@ -283,76 +289,270 @@ function buildUvmHierarchy(allClasses: Map<string, UvmClassInfo>): UvmNode[] {
 }
 
 /**
- * Detect DUT modules by finding modules instantiated in testbench top modules.
- * A testbench top is identified by containing a `run_test()` call.
+ * Propagate `uvmType` along the inheritance chain so that user-derived
+ * classes inherit the semantic role of their ancestor. Runs until no more
+ * changes occur, handling arbitrarily deep chains like:
+ *   axi_monitor → my_mon_base → uvm_monitor
  *
- * Strategy:
- *  1. Primary: instances of tb_top modules that are known parsed modules
- *     (filters out interfaces/primitives not in allModules).
- *  2. Fallback: if no DUTs found, look for "companion top" modules —
- *     top-level modules in the same file set that aren't tb_tops but
- *     instantiate real modules (handles split top/testbench patterns).
+ * Works across project boundaries because it operates on the flat map
+ * of all classes found in the workspace.
  */
-function detectDuts(allModules: Map<string, ModuleNode>, fileTexts: Map<string, string>): DutInfo[] {
-  // Find testbench top files (files containing run_test())
-  const tbTopFiles = new Set<string>();
-  for (const [filePath, text] of fileTexts) {
-    if (/\brun_test\s*\(/.test(text)) {
-      tbTopFiles.add(filePath);
-    }
-  }
-
-  // Find modules in testbench top files — these are testbench top modules
-  const tbTopModules = new Set<string>();
-  for (const mod of allModules.values()) {
-    if (tbTopFiles.has(mod.filePath)) {
-      tbTopModules.add(mod.name);
-    }
-  }
-
-  // Helper: collect DUT candidates from a module's instances
-  const duts: DutInfo[] = [];
-  const seen = new Set<string>();
-  const collectDutsFrom = (mod: ModuleNode) => {
-    for (const inst of mod.instances) {
-      if (tbTopModules.has(inst.moduleName) || seen.has(inst.moduleName)) continue;
-      // Only treat as DUT if it's a known parsed module (not an interface/primitive)
-      if (!allModules.has(inst.moduleName)) continue;
-      seen.add(inst.moduleName);
-      const dutMod = allModules.get(inst.moduleName)!;
-      duts.push({
-        moduleName: inst.moduleName,
-        instanceName: inst.instanceName,
-        filePath: dutMod.filePath,
-        line: dutMod.line,
-      });
-    }
-  };
-
-  // Primary: check tb_top module instances
-  for (const tbName of tbTopModules) {
-    const tb = allModules.get(tbName);
-    if (tb) collectDutsFrom(tb);
-  }
-
-  // Fallback: if no DUTs found, look for companion top-level modules
-  if (duts.length === 0 && tbTopModules.size > 0) {
-    // Build set of modules instantiated by any other module
-    const instantiated = new Set<string>();
-    for (const mod of allModules.values()) {
-      for (const inst of mod.instances) {
-        instantiated.add(inst.moduleName);
+function resolveUvmTypesTransitively(allClasses: Map<string, UvmClassInfo>): void {
+  let changed = true;
+  let iterations = 0;
+  while (changed && iterations++ < 32) {
+    changed = false;
+    for (const cls of allClasses.values()) {
+      if (cls.uvmType !== 'unknown') continue;
+      const rawBase = cls.baseClass.replace(/\s*#\s*\(.*\)/, '').trim();
+      // Base may be scoped like `my_pkg::my_mon_base` — also try the unqualified name.
+      const parent = allClasses.get(rawBase) ?? allClasses.get(rawBase.split('::').pop() ?? rawBase);
+      if (parent && parent.uvmType !== 'unknown') {
+        cls.uvmType = parent.uvmType;
+        changed = true;
       }
     }
-    // Companion tops: top-level modules that aren't tb_tops
-    for (const mod of allModules.values()) {
-      if (tbTopModules.has(mod.name)) continue;
-      if (instantiated.has(mod.name)) continue;
-      collectDutsFrom(mod);
+  }
+}
+
+// ─── Smart DUT detection ────────────────────────────────────────────
+
+interface DutCandidate {
+  name: string;
+  instanceName: string;
+  filePath: string;
+  line: number;
+  score: number;
+  reasons: string[];
+}
+
+/** Utility / non-DUT module naming patterns. */
+const UTILITY_NAME_RE = /\b(clk_gen|clock_gen|rst_gen|reset_gen|tb_gen|gen_clk|gen_rst|assertion|assertions|checker|sva_|bind_|tb_helper|stim_gen)\b/i;
+
+/** Typical instance names for DUTs. */
+const DUT_INSTANCE_RE = /(^|_)dut($|_)|^u_dut$|^i_dut$|^m_dut$|^s_dut$/i;
+
+/**
+ * Detect DUT modules. The testbench is identified by finding files containing
+ * `run_test(...)`; each module in such a file is a tb_top candidate. For each
+ * tb_top, this routine ranks candidate DUTs using several signals:
+ *
+ *   +100  instance binds at least one port to a virtual-interface instance
+ *         (interfaces published via `uvm_config_db#(virtual ...)::set(...)`)
+ *   +50   instance binds ports to any interface instance declared in tb_top
+ *   +30   instance name matches `dut`/`*_dut`/`u_dut` convention
+ *   +20   module body contains RTL constructs (always/assign/generate)
+ *   +min(10,N) number of ports (more ports → more likely RTL)
+ *   -100  name matches a utility/assertion pattern (clk_gen, checker, etc.)
+ *   -40   module has no ports at all
+ *
+ * If no candidate scores strongly, falls back to the legacy behavior of
+ * returning all directly-instantiated modules (minus tb_tops).
+ */
+function detectDuts(allModules: Map<string, ModuleNode>, fileTexts: Map<string, string>): DutInfo[] {
+  // 1. Identify tb_top files / modules
+  const tbTopFiles = new Set<string>();
+  for (const [filePath, text] of fileTexts) {
+    if (/\brun_test\s*\(/.test(text)) tbTopFiles.add(filePath);
+  }
+  if (tbTopFiles.size === 0) return [];
+
+  const tbTopModules = new Set<string>();
+  for (const mod of allModules.values()) {
+    if (tbTopFiles.has(mod.filePath)) tbTopModules.add(mod.name);
+  }
+
+  // 2. Collect candidate-providing tops:
+  //    - primary: tb_top modules themselves
+  //    - companion: top-level modules in tb_top files OR in files that share a
+  //      directory with a tb_top file (handles split top.sv / testbench.sv).
+  const instantiated = new Set<string>();
+  for (const mod of allModules.values()) {
+    for (const inst of mod.instances) instantiated.add(inst.moduleName);
+  }
+
+  const tbDirs = new Set<string>();
+  for (const fp of tbTopFiles) {
+    const slash = fp.lastIndexOf('/');
+    if (slash >= 0) tbDirs.add(fp.slice(0, slash));
+  }
+  const siblingDirs = new Set<string>();
+  for (const d of tbDirs) {
+    const slash = d.lastIndexOf('/');
+    if (slash >= 0) siblingDirs.add(d.slice(0, slash));
+  }
+
+  const companionModules = new Set<string>();
+  for (const mod of allModules.values()) {
+    if (tbTopModules.has(mod.name)) continue;
+    if (instantiated.has(mod.name)) continue;
+    const modDir = mod.filePath.slice(0, mod.filePath.lastIndexOf('/'));
+    const inTbDir = tbDirs.has(modDir) || tbTopFiles.has(mod.filePath);
+    const inSiblingTree = [...siblingDirs].some(sd => modDir.startsWith(sd));
+    if (inTbDir || inSiblingTree) companionModules.add(mod.name);
+  }
+
+  const hostModules = [
+    ...[...tbTopModules].map(n => allModules.get(n)!).filter(Boolean),
+    ...[...companionModules].map(n => allModules.get(n)!).filter(Boolean),
+  ];
+
+  // 3. Score each distinct instantiated module.
+  const byName = new Map<string, DutCandidate>();
+  for (const host of hostModules) {
+    const hostText = fileTexts.get(host.filePath) ?? '';
+    const vifInstances = findVifPublishedInstances(hostText);
+    const allInterfaceInstances = findInterfaceInstanceNames(hostText);
+
+    for (const inst of host.instances) {
+      if (tbTopModules.has(inst.moduleName)) continue;
+      if (!allModules.has(inst.moduleName)) continue;
+      const mod = allModules.get(inst.moduleName)!;
+      if (tbTopFiles.has(mod.filePath)) continue; // skip modules defined in tb_top file
+
+      const existing = byName.get(inst.moduleName);
+      const portBody = extractInstancePortBody(hostText, inst);
+      const bindsToVif = vifInstances.size > 0 &&
+        [...vifInstances].some(v => new RegExp(`\\b${escapeRegex(v)}\\s*\\.`).test(portBody));
+      const bindsToIface = !bindsToVif && allInterfaceInstances.size > 0 &&
+        [...allInterfaceInstances].some(v => new RegExp(`\\b${escapeRegex(v)}\\s*\\.`).test(portBody));
+
+      let score = 0;
+      const reasons: string[] = [];
+      if (bindsToVif)   { score += 100; reasons.push('binds to virtual-interface-published instance'); }
+      if (bindsToIface) { score += 50;  reasons.push('binds to interface instance in tb_top'); }
+      if (DUT_INSTANCE_RE.test(inst.instanceName)) { score += 30; reasons.push(`instance named "${inst.instanceName}"`); }
+      if (hasRtlConstructs(fileTexts.get(mod.filePath) ?? '', mod.name)) { score += 20; reasons.push('module body has RTL constructs'); }
+      score += Math.min(10, mod.ports.length);
+      if (mod.ports.length === 0) { score -= 40; reasons.push('no ports'); }
+      if (UTILITY_NAME_RE.test(mod.name)) { score -= 100; reasons.push('utility/checker name'); }
+
+      if (!existing || score > existing.score) {
+        byName.set(inst.moduleName, {
+          name: inst.moduleName,
+          instanceName: inst.instanceName,
+          filePath: mod.filePath,
+          line: mod.line,
+          score,
+          reasons,
+        });
+      }
     }
   }
 
-  return duts;
+  const candidates = [...byName.values()].sort((a, b) => b.score - a.score);
+
+  // 4. Select winners:
+  //    - If any candidate scores ≥ 50 (strong signal), return only those.
+  //    - Otherwise return every positively-scored candidate.
+  //    - If still empty, fall back to the old behavior so we never come up empty
+  //      on oddly-structured testbenches.
+  const strong = candidates.filter(c => c.score >= 50);
+  const picked = strong.length > 0 ? strong : candidates.filter(c => c.score > 0);
+
+  if (picked.length > 0) {
+    return picked.map(({ name, instanceName, filePath, line }) => ({
+      moduleName: name, instanceName, filePath, line,
+    }));
+  }
+
+  // Fallback: all direct instances of tb_tops (+ companion tops), deduped.
+  const fallback: DutInfo[] = [];
+  const seen = new Set<string>();
+  for (const host of hostModules) {
+    for (const inst of host.instances) {
+      if (seen.has(inst.moduleName)) continue;
+      if (tbTopModules.has(inst.moduleName)) continue;
+      if (!allModules.has(inst.moduleName)) continue;
+      const mod = allModules.get(inst.moduleName)!;
+      if (tbTopFiles.has(mod.filePath)) continue;
+      seen.add(inst.moduleName);
+      fallback.push({ moduleName: inst.moduleName, instanceName: inst.instanceName, filePath: mod.filePath, line: mod.line });
+    }
+  }
+  return fallback;
+}
+
+/** Extract instance names published via `uvm_config_db#(virtual <type>)::set(ctx, path, name, <inst>)`. */
+function findVifPublishedInstances(text: string): Set<string> {
+  const result = new Set<string>();
+  const re = /uvm_config_db\s*#\s*\(\s*virtual\s+[\w:.]+(?:\s*\.\s*\w+)?\s*\)\s*::\s*set\s*\(([^;]*?)\)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    // Split args at top-level commas. Only the last one is the instance name.
+    const args = splitTopLevelArgs(m[1]);
+    if (args.length >= 2) {
+      const last = args[args.length - 1].trim();
+      const id = last.match(/^(\w+)$/);
+      if (id) result.add(id[1]);
+    }
+  }
+  return result;
+}
+
+/** Detect interface instance names by matching `<type> <name>(...);` where <type> ends in `interface`
+ *  or is a SV keyword-free identifier used in a `virtual <type>` uvm_config_db elsewhere. Heuristic but cheap. */
+function findInterfaceInstanceNames(text: string): Set<string> {
+  const result = new Set<string>();
+  // Any line that looks like `foo_if name(...)` or `foo_interface name(...)` where type looks like an interface.
+  const re = /^\s*(\w*(?:if|interface|intf))\s+(?:#\s*\((?:[^()]|\([^()]*\))*\)\s*)?(\w+)\s*\(/gim;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    if (m[1].toLowerCase() === 'interface') continue;
+    result.add(m[2]);
+  }
+  return result;
+}
+
+function extractInstancePortBody(hostText: string, inst: ModuleInstance): string {
+  // Find the port-list body of this instance. Use the line as a starting offset.
+  const lines = hostText.split('\n');
+  if (inst.line < 1 || inst.line > lines.length) return '';
+  // Build offset of this line
+  let offset = 0;
+  for (let i = 0; i < inst.line - 1; i++) offset += lines[i].length + 1;
+  // Search forward for first '(' after module name
+  const openIdx = hostText.indexOf('(', offset);
+  if (openIdx < 0) return '';
+  // Walk paren depth to find the matching ')'
+  let depth = 0;
+  for (let i = openIdx; i < hostText.length; i++) {
+    const c = hostText[i];
+    if (c === '(') depth++;
+    else if (c === ')') { depth--; if (depth === 0) return hostText.slice(openIdx + 1, i); }
+  }
+  return hostText.slice(openIdx + 1);
+}
+
+function hasRtlConstructs(text: string, moduleName: string): boolean {
+  // Find the module body and look for RTL constructs
+  const declRe = new RegExp(`\\bmodule\\s+${escapeRegex(moduleName)}\\b`);
+  const m = declRe.exec(text);
+  if (!m) return false;
+  const endIdx = text.indexOf('endmodule', m.index);
+  const body = endIdx > 0 ? text.slice(m.index, endIdx) : text.slice(m.index);
+  return /\balways(?:_ff|_comb|_latch)?\b|\bassign\s+\w+\s*=|\bgenerate\b/.test(body);
+}
+
+function splitTopLevelArgs(s: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') depth--;
+    else if (c === ',' && depth === 0) {
+      out.push(s.slice(start, i));
+      start = i + 1;
+    }
+  }
+  out.push(s.slice(start));
+  return out;
+}
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 /**

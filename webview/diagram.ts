@@ -73,28 +73,38 @@ function snap(v: number): number { return Math.round(v / GRID) * GRID; }
 
 // Pipeline stage order (lower = further left)
 const STAGE: Record<string, number> = {
-  sequence: 0, sequencer: 1, driver: 2,
+  sequence: 0, reg_sequence: 0,
+  sequencer: 1,
+  driver: 2, reg_adapter: 2,
   dut: 3,
-  monitor: 4, scoreboard: 5,
-  agent: -1, env: -1, test: -1,
+  monitor: 4, reg_predictor: 4,
+  scoreboard: 5, subscriber: 5,
+  agent: -1, env: -1, test: -1, reg_block: -1,
+  reg: -1,
   component: 2, object: -1, unknown: -1,
 };
 
 // ─── Color themes ─────────────────────────────────────────────
 interface Theme { fill: string; stroke: string; accent: string }
 const THEMES: Record<string, Theme> = {
-  test:       { fill: '#1a3a2a', stroke: '#4ec9b0', accent: '#4ec9b0' },
-  env:        { fill: '#1a2a3a', stroke: '#569cd6', accent: '#569cd6' },
-  agent:      { fill: '#1a2a1a', stroke: '#6a9955', accent: '#6a9955' },
-  driver:     { fill: '#2a2010', stroke: '#ce9178', accent: '#ce9178' },
-  monitor:    { fill: '#2a2a10', stroke: '#dcdcaa', accent: '#dcdcaa' },
-  sequencer:  { fill: '#2a1a2a', stroke: '#c586c0', accent: '#c586c0' },
-  scoreboard: { fill: '#2a1515', stroke: '#d16969', accent: '#d16969' },
-  sequence:   { fill: '#152a2a', stroke: '#b5cea8', accent: '#b5cea8' },
-  component:  { fill: '#1a2a2a', stroke: '#9cdcfe', accent: '#9cdcfe' },
-  object:     { fill: '#222',    stroke: '#888',    accent: '#888'    },
-  dut:        { fill: '#1a1a2e', stroke: '#e6b422', accent: '#e6b422' },
-  unknown:    { fill: '#222',    stroke: '#666',    accent: '#666'    },
+  test:          { fill: '#1a3a2a', stroke: '#4ec9b0', accent: '#4ec9b0' },
+  env:           { fill: '#1a2a3a', stroke: '#569cd6', accent: '#569cd6' },
+  agent:         { fill: '#1a2a1a', stroke: '#6a9955', accent: '#6a9955' },
+  driver:        { fill: '#2a2010', stroke: '#ce9178', accent: '#ce9178' },
+  monitor:       { fill: '#2a2a10', stroke: '#dcdcaa', accent: '#dcdcaa' },
+  sequencer:     { fill: '#2a1a2a', stroke: '#c586c0', accent: '#c586c0' },
+  scoreboard:    { fill: '#2a1515', stroke: '#d16969', accent: '#d16969' },
+  sequence:      { fill: '#152a2a', stroke: '#b5cea8', accent: '#b5cea8' },
+  subscriber:    { fill: '#2a2020', stroke: '#f07a7a', accent: '#f07a7a' },
+  reg_block:     { fill: '#2a2510', stroke: '#f0c060', accent: '#f0c060' },
+  reg:           { fill: '#2a2518', stroke: '#e6b48a', accent: '#e6b48a' },
+  reg_sequence:  { fill: '#252a15', stroke: '#d7d86b', accent: '#d7d86b' },
+  reg_adapter:   { fill: '#2a2215', stroke: '#d19a66', accent: '#d19a66' },
+  reg_predictor: { fill: '#2a2815', stroke: '#c4b454', accent: '#c4b454' },
+  component:     { fill: '#1a2a2a', stroke: '#9cdcfe', accent: '#9cdcfe' },
+  object:        { fill: '#222',    stroke: '#888',    accent: '#888'    },
+  dut:           { fill: '#1a1a2e', stroke: '#e6b422', accent: '#e6b422' },
+  unknown:       { fill: '#222',    stroke: '#666',    accent: '#666'    },
 };
 
 // ─── State ────────────────────────────────────────────────────
@@ -346,7 +356,7 @@ function renderProject(roots: UvmDiagramNode[], duts: DutInfo[], connOverrides?:
     if (pipelineChildren.length > 0) {
       for (const ch of pipelineChildren) allLeaves.push({ node: ch, ancestors: [...ancestors, n] });
     }
-    for (const ch of [...nonPipelineChildren, ...n.children.filter(c => c.uvmType === 'agent' || c.uvmType === 'env')]) {
+    for (const ch of [...nonPipelineChildren, ...n.children.filter(c => c.uvmType === 'agent' || c.uvmType === 'env' || c.uvmType === 'reg_block')]) {
       collectLeaves(ch, [...ancestors, n]);
     }
     if (pipelineChildren.length === 0 && nonPipelineChildren.length === 0 && STAGE[n.uvmType] >= 0) {
@@ -1318,6 +1328,39 @@ function drawIcon(g: SVGGElement, type: string, w: number, color: string): void 
       ig.appendChild(s('line', { x1: 5, y1: 0, x2: 5, y2: 2 }));
       ig.appendChild(s('line', { x1: 9, y1: 0, x2: 9, y2: 2 }));
       break;
+    case 'reg_block':
+      ig.appendChild(s('rect', { x: 1, y: 1, width: 12, height: 12, rx: 1 }));
+      ig.appendChild(s('line', { x1: 1, y1: 5, x2: 13, y2: 5 }));
+      ig.appendChild(s('line', { x1: 1, y1: 9, x2: 13, y2: 9 }));
+      ig.appendChild(s('line', { x1: 5, y1: 1, x2: 5, y2: 13 }));
+      break;
+    case 'reg':
+      ig.appendChild(s('rect', { x: 1.5, y: 3, width: 11, height: 8, rx: 1 }));
+      ig.appendChild(s('line', { x1: 4, y1: 3, x2: 4, y2: 11 }));
+      ig.appendChild(s('line', { x1: 7, y1: 3, x2: 7, y2: 11 }));
+      ig.appendChild(s('line', { x1: 10, y1: 3, x2: 10, y2: 11 }));
+      break;
+    case 'reg_sequence':
+      ig.appendChild(s('rect', { x: 3, y: 1, width: 9, height: 6, rx: 1 }));
+      ig.appendChild(s('rect', { x: 1.5, y: 3.5, width: 9, height: 6, rx: 1 }));
+      ig.appendChild(s('rect', { x: 0, y: 6, width: 9, height: 6, rx: 1 }));
+      ig.appendChild(s('path', { d: 'M10,9.5 l2,1 l-2,1' }));
+      break;
+    case 'reg_adapter':
+      ig.appendChild(s('path', { d: 'M1,7 h5 l-2,-2 M6,7 l-2,2' }));
+      ig.appendChild(s('rect', { x: 6, y: 3, width: 7, height: 8, rx: 1 }));
+      ig.appendChild(s('line', { x1: 9.5, y1: 3, x2: 9.5, y2: 11 }));
+      break;
+    case 'reg_predictor':
+      ig.appendChild(s('rect', { x: 1.5, y: 1.5, width: 11, height: 8, rx: 1 }));
+      ig.appendChild(s('polyline', { points: '3.5,5.5 5,3.5 6.5,7 8,4 9.5,6.5 11,4.5' }));
+      ig.appendChild(s('path', { d: 'M4,11 h6 l-1,1.5 M4,11 l1,1.5' }));
+      break;
+    case 'subscriber':
+      ig.appendChild(s('rect', { x: 1.5, y: 3, width: 11, height: 8, rx: 1 }));
+      ig.appendChild(s('path', { d: 'M4,7 h6 M7,4 v6' }));
+      ig.appendChild(s('line', { x1: 0, y1: 1, x2: 2, y2: 3 }));
+      break;
     case 'object':
       ig.appendChild(s('path', { d: 'M2,1.5 h6.5 l3,3 v8 a1,1,0,0,1-1,1 h-8.5 a1,1,0,0,1-1-1 v-10 a1,1,0,0,1,1-1 z' }));
       ig.appendChild(s('path', { d: 'M8.5,1.5 v3 h3' }));
@@ -1344,6 +1387,12 @@ function legendIconHtml(type: string): string {
     case 'sequence': return `<svg width="14" height="14" viewBox="0 0 14 14"><rect ${s} x="3" y="1" width="9" height="6" rx="1"/><rect ${s} x="1.5" y="3.5" width="9" height="6" rx="1"/><rect ${s} x="0" y="6" width="9" height="6" rx="1"/></svg>`;
     case 'component': return `<svg width="14" height="14" viewBox="0 0 14 14"><rect ${s} x="3.5" y="2" width="7" height="10" rx="1"/><line ${s} x1="1" y1="5" x2="3.5" y2="5"/><line ${s} x1="1" y1="9" x2="3.5" y2="9"/><line ${s} x1="10.5" y1="5" x2="13" y2="5"/><line ${s} x1="10.5" y1="9" x2="13" y2="9"/></svg>`;
     case 'dut': return `<svg width="14" height="14" viewBox="0 0 14 14"><rect ${s} x="3" y="2" width="8" height="10" rx="1"/><line ${s} x1="0" y1="4" x2="3" y2="4"/><line ${s} x1="0" y1="7" x2="3" y2="7"/><line ${s} x1="0" y1="10" x2="3" y2="10"/><line ${s} x1="11" y1="4" x2="14" y2="4"/><line ${s} x1="11" y1="7" x2="14" y2="7"/><line ${s} x1="11" y1="10" x2="14" y2="10"/><line ${s} x1="5" y1="0" x2="5" y2="2"/><line ${s} x1="9" y1="0" x2="9" y2="2"/></svg>`;
+    case 'reg_block': return `<svg width="14" height="14" viewBox="0 0 14 14"><rect ${s} x="1" y="1" width="12" height="12" rx="1"/><line ${s} x1="1" y1="5" x2="13" y2="5"/><line ${s} x1="1" y1="9" x2="13" y2="9"/><line ${s} x1="5" y1="1" x2="5" y2="13"/></svg>`;
+    case 'reg': return `<svg width="14" height="14" viewBox="0 0 14 14"><rect ${s} x="1.5" y="3" width="11" height="8" rx="1"/><line ${s} x1="4" y1="3" x2="4" y2="11"/><line ${s} x1="7" y1="3" x2="7" y2="11"/><line ${s} x1="10" y1="3" x2="10" y2="11"/></svg>`;
+    case 'reg_sequence': return `<svg width="14" height="14" viewBox="0 0 14 14"><rect ${s} x="3" y="1" width="9" height="6" rx="1"/><rect ${s} x="1.5" y="3.5" width="9" height="6" rx="1"/><rect ${s} x="0" y="6" width="9" height="6" rx="1"/><path ${s} d="M10,9.5 l2,1 l-2,1"/></svg>`;
+    case 'reg_adapter': return `<svg width="14" height="14" viewBox="0 0 14 14"><path ${s} d="M1,7 h5 l-2,-2 M6,7 l-2,2"/><rect ${s} x="6" y="3" width="7" height="8" rx="1"/><line ${s} x1="9.5" y1="3" x2="9.5" y2="11"/></svg>`;
+    case 'reg_predictor': return `<svg width="14" height="14" viewBox="0 0 14 14"><rect ${s} x="1.5" y="1.5" width="11" height="8" rx="1"/><polyline ${s} points="3.5,5.5 5,3.5 6.5,7 8,4 9.5,6.5 11,4.5"/><path ${s} d="M4,11 h6 l-1,1.5 M4,11 l1,1.5"/></svg>`;
+    case 'subscriber': return `<svg width="14" height="14" viewBox="0 0 14 14"><rect ${s} x="1.5" y="3" width="11" height="8" rx="1"/><path ${s} d="M4,7 h6 M7,4 v6"/><line ${s} x1="0" y1="1" x2="2" y2="3"/></svg>`;
     case 'object': return `<svg width="14" height="14" viewBox="0 0 14 14"><path ${s} d="M2,1.5 h6.5 l3,3 v8 a1,1,0,0,1-1,1 h-8.5 a1,1,0,0,1-1-1 v-10 a1,1,0,0,1,1-1 z"/><path ${s} d="M8.5,1.5 v3 h3"/></svg>`;
     default: return `<svg width="14" height="14" viewBox="0 0 14 14"><rect ${s} x="2" y="2" width="10" height="10" rx="2"/></svg>`;
   }
@@ -1377,7 +1426,7 @@ function drawLegendOverlay(): void {
 // ═ MAPPING TABLE
 // ═══════════════════════════════════════════════════════════════
 
-const VALID_ROLES = ['test', 'env', 'agent', 'driver', 'monitor', 'sequencer', 'scoreboard', 'sequence', 'dut', 'component'];
+const VALID_ROLES = ['test', 'env', 'agent', 'driver', 'monitor', 'sequencer', 'scoreboard', 'sequence', 'subscriber', 'reg_block', 'reg', 'reg_sequence', 'reg_adapter', 'reg_predictor', 'dut', 'component'];
 
 function buildComponentList(roots: UvmDiagramNode[], duts: DutInfo[]): MappingComponent[] {
   const components: MappingComponent[] = [];

@@ -8,8 +8,9 @@ const MODULE_DECL_RE =
 
 // ─── Module instantiations ──────────────────────────────────────────
 // Matches: module_name #(...) inst_name (...);  or  module_name inst_name (...);
+// Param block allows one level of nested parens (e.g. `#(.P(mode))`).
 const MODULE_INST_RE =
-  /^\s*(\w+)\s+(?:#\s*\([^)]*\)\s+)?(\w+)\s*\(/gm;
+  /^\s*(\w+)\s*(?:#\s*\((?:[^()]|\([^()]*\))*\)\s*)?(\w+)\s*\(/gm;
 
 // Known SV keywords that look like instantiation but aren't
 const SV_KEYWORDS = new Set([
@@ -32,8 +33,11 @@ const SV_KEYWORDS = new Set([
 const PORT_RE = /\b(input|output|inout)\s+(?:\w+\s+)?(?:\[.*?\]\s*)?(\w+)/g;
 
 // ─── UVM class declarations ────────────────────────────────────────
+// Handles: optional `virtual` prefix, parameterized class name `foo #(...)`,
+// and parameterized base class `bar #(...)`. Base capture group tolerates
+// whitespace, nested parentheses one level deep, and scoped names like `pkg::cls`.
 const CLASS_DECL_RE =
-  /^\s*class\s+(\w+)\s+extends\s+([\w#() ,]+?)\s*;/gm;
+  /^\s*(?:virtual\s+)?class\s+(\w+)(?:\s*#\s*\([^;]*?\))?\s+extends\s+((?:\w|::)+(?:\s*#\s*\((?:[^()]|\([^()]*\))*\))?)\s*(?:implements\s+[\w:,\s]+)?\s*;/gm;
 
 // ─── Field declarations inside class body (heuristic) ──────────────
 // Matches: type_name field_name;

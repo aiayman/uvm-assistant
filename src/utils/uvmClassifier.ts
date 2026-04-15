@@ -5,14 +5,24 @@ const UVM_BASE_CLASS_MAP: Record<string, UvmType> = {
   'uvm_env': 'env',
   'uvm_agent': 'agent',
   'uvm_driver': 'driver',
+  'uvm_push_driver': 'driver',
   'uvm_monitor': 'monitor',
   'uvm_scoreboard': 'scoreboard',
   'uvm_sequence': 'sequence',
   'uvm_sequence_base': 'sequence',
   'uvm_sequencer': 'sequencer',
   'uvm_sequencer_base': 'sequencer',
+  'uvm_push_sequencer': 'sequencer',
+  'uvm_subscriber': 'subscriber',
+  'uvm_reg_block': 'reg_block',
+  'uvm_reg': 'reg',
+  'uvm_reg_sequence': 'reg_sequence',
+  'uvm_reg_adapter': 'reg_adapter',
+  'uvm_reg_predictor': 'reg_predictor',
   'uvm_component': 'component',
   'uvm_object': 'object',
+  'uvm_transaction': 'object',
+  'uvm_sequence_item': 'object',
 };
 
 /**
@@ -36,6 +46,12 @@ export function uvmTypeIcon(uvmType: UvmType): string {
     case 'scoreboard': return 'uvm-scoreboard';
     case 'sequence': return 'uvm-sequence';
     case 'sequencer': return 'uvm-sequencer';
+    case 'subscriber': return 'uvm-subscriber';
+    case 'reg_block': return 'uvm-reg-block';
+    case 'reg': return 'uvm-reg';
+    case 'reg_sequence': return 'uvm-reg-sequence';
+    case 'reg_adapter': return 'uvm-reg-adapter';
+    case 'reg_predictor': return 'uvm-reg-predictor';
     case 'component': return 'uvm-component';
     default: return 'uvm-class';
   }

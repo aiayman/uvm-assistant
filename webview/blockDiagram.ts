@@ -205,8 +205,8 @@ function draw(
   badge.textContent = `[${node.uvmType}]`;
   g.appendChild(badge);
 
-  // Click to open file
-  g.addEventListener('click', (e) => {
+  // Double-click to open file in editor
+  g.addEventListener('dblclick', (e) => {
     e.stopPropagation();
     vscode.postMessage({ command: 'openFile', filePath: node.filePath, line: node.line });
   });

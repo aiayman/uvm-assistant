@@ -7,6 +7,12 @@ export type UvmType =
   | 'scoreboard'
   | 'sequence'
   | 'sequencer'
+  | 'reg_block'
+  | 'reg'
+  | 'reg_sequence'
+  | 'reg_adapter'
+  | 'reg_predictor'
+  | 'subscriber'
   | 'component'
   | 'object'
   | 'unknown';
