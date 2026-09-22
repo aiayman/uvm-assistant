@@ -1,19 +1,31 @@
 # UVM-Assistant
 
-A VS Code extension for analyzing Verilog/SystemVerilog workspaces with deep UVM support. Visualize module hierarchies, UVM class trees, and interactive block diagrams — plus get real-time linting and formatting.
+A VS Code extension for analyzing Verilog/SystemVerilog workspaces with deep UVM support. Visualize module hierarchies, UVM class trees, and interactive testbench diagrams — plus real-time linting and formatting.
 
 ## Features
 
 ### Module Hierarchy
-Automatically discovers all modules across your workspace and displays the instantiation tree in the sidebar. Click any module to jump to its source.
+Discovers every module in the workspace and shows the instantiation tree in the sidebar. Click a module to jump to its source.
 
 ### UVM Class Hierarchy
-Parses UVM classes, resolves inheritance and containment (via field declarations and `type_id::create()` calls), and displays the component tree.
+Parses UVM classes, resolves inheritance and containment (via field declarations and `type_id::create()` calls), and shows the component tree. Roles are inherited down user-defined base classes, so `axi_monitor extends my_mon_base extends uvm_monitor` still classifies as a monitor.
 
 ### UVM Block Diagram
-Interactive SVG diagram showing your UVM testbench architecture. Pan, zoom, and click any block to open the source file.
+Nested-rectangle view of the component containment hierarchy. Pan, zoom, and double-click a block to open its source.
 
-### UVM Linter (22+ Rules)
+### UVM Data Flow Diagram
+Pipeline view of the testbench laid out left-to-right by role:
+
+```
+Sequence → Sequencer → Driver → [DUT] → Monitor → Scoreboard
+```
+
+Connections are routed orthogonally with a grid A* router — arrows never cross a block, always enter from the left and exit to the right. Double-click an arrow to jump to the `connect_phase` line that created it.
+
+### Mapping Table
+A toggleable panel listing every detected component and connection. Reclassify a component's role, remove a false positive, or add something the parser missed. Edits persist to `.uvm-assistant.json` in the workspace root and are reapplied on every analysis.
+
+### UVM Linter
 Catches common UVM mistakes as you work:
 
 | Rule | Severity | Description |
@@ -38,20 +50,20 @@ Catches common UVM mistakes as you work:
 | UVM023 | Warning | Agent has no monitor |
 
 ### Verible Formatter
-Integrates [Verible](https://github.com/chipsalliance/verible) for document and range formatting. A pre-built binary is bundled, or you can point to your own installation.
+Integrates [Verible](https://github.com/chipsalliance/verible) for document and range formatting. A pre-built binary is bundled, or point the extension at your own installation.
 
 ## Installation
 
 ### From VSIX
 Download the latest `.vsix` from [Releases](https://github.com/aiayman/uvm-assistant/releases), then:
 
-```
+```bash
 code --install-extension uvm-assistant-x.y.z.vsix
 ```
 
-Or in VS Code: `Ctrl+Shift+P` > `Extensions: Install from VSIX...`
+Or in VS Code: `Ctrl+Shift+P` → `Extensions: Install from VSIX...`
 
-### From Source
+### From source
 ```bash
 git clone https://github.com/aiayman/uvm-assistant.git
 cd uvm-assistant
@@ -62,17 +74,18 @@ code --install-extension uvm-assistant-*.vsix
 
 ## Usage
 
-1. Open a folder containing `.sv`, `.v`, `.svh`, or `.vh` files
-2. Click the **UVM-Assistant** icon in the Activity Bar
-3. The extension automatically scans and analyzes your workspace
-4. Use the **Refresh** button to re-analyze after changes
+1. Open a folder containing `.sv`, `.v`, `.svh`, or `.vh` files.
+2. Click the **UVM-Assistant** icon in the Activity Bar.
+3. The extension scans and analyzes the workspace automatically. Files excluded by `.gitignore` are skipped.
+4. Analysis re-runs on file changes; use **Refresh** to force it.
 
 ### Commands
 
 | Command | Description |
 |---------|-------------|
 | `UVM-Assistant: Refresh Analysis` | Re-scan and re-analyze the workspace |
-| `UVM-Assistant: Open UVM Block Diagram` | Show interactive UVM architecture diagram |
+| `UVM-Assistant: Open UVM Block Diagram` | Component containment diagram |
+| `UVM-Assistant: Open UVM Data Flow Diagram` | Pipeline diagram with routed connections |
 | `UVM-Assistant: Format with Verible` | Format the active document |
 
 ## Configuration
@@ -84,13 +97,25 @@ code --install-extension uvm-assistant-*.vsix
 | `uvm-assistant.verible.portDeclarationsAlignment` | `infer` | Port alignment: `align`, `flush-left`, `preserve`, `infer` |
 | `uvm-assistant.verible.tryWrapLongLines` | `true` | Attempt to wrap long lines |
 
+### `.uvm-assistant.json`
+
+Written by the mapping table, and safe to edit by hand. All keys are optional:
+
+```json
+{
+  "addedComponents":   [{ "name": "my_ram", "role": "dut", "filePath": "/abs/path/ram.sv", "line": 1 }],
+  "removedComponents": ["clk_gen"],
+  "roleOverrides":     { "my_custom_checker": "scoreboard" },
+  "addedConnections":  [{ "from": "my_monitor", "to": "my_scoreboard", "label": "analysis_port" }],
+  "removedConnections":[{ "from": "my_driver", "to": "my_ram" }]
+}
+```
+
 ## Architecture
 
-The extension uses a dual-parsing strategy:
-- **Tree-sitter** (via WebAssembly) for fast, accurate AST parsing when the SystemVerilog grammar is available
-- **Regex fallback** for environments where the grammar WASM isn't bundled, and to supplement tree-sitter with UVM macro detection
+The extension uses a dual-parsing strategy: **tree-sitter** (via WebAssembly) for AST parsing when the SystemVerilog grammar is available, with a **regex fallback** that also supplements tree-sitter with UVM macro and field detection. Parse results feed the hierarchy builders, linter, and diagram renderers; file contents are read once and shared across all consumers.
 
-Parsing results feed into the hierarchy builders, linter, and diagram renderer. File contents are read once and shared across all consumers.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the internals and [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for the build and release workflow.
 
 ## License
 

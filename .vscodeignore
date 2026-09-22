@@ -9,3 +9,5 @@ esbuild.js
 **/*.map
 .gitignore
 !bin/
+docs/
+*.vsix

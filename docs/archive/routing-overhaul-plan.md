@@ -1,5 +1,12 @@
 # UVM Data-Flow Diagram: Placement & Routing Overhaul Plan
 
+> **Archived — superseded.** This plan describes the *channel-based* router that shipped in
+> v1.12.0. It was replaced in v1.15.0 by the grid-based A\* router, so the routing sections
+> below no longer describe the code. The placement design (stage columns, cell sizing, agent
+> grouping) is still broadly accurate. Kept for the constraints in "Constraints
+> (Non-Negotiable)" and the reasoning behind them. For what the code does today, see
+> [../ARCHITECTURE.md](../ARCHITECTURE.md).
+
 ## Problem Statement
 
 The current layout and routing code has accumulated incremental patches that don't address the root issues. The result is arrows that strike through blocks, inclined/diagonal segments, poor vertical channel usage, and connection-point overlap. The code needs a clean, structured overhaul of both **placement** (where blocks go) and **routing** (how arrows travel between them).
